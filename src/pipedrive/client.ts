@@ -1,5 +1,5 @@
 import { ConfigError, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { PipedriveHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import { PipedriveHttpError, describeUrl, parseRetryAfterMs, RedirectRefusedError, requestIdFrom, SecretRedactor } from '../errors.js';
 import { USER_AGENT } from '../version.js';
 import { admitsKey } from '../key-admission.js';
 
@@ -420,7 +420,11 @@ export class PipedriveClient implements UpstreamClient {
     const answer = await this.execute(false, 'POST', this.tokenUrl, init, async response => {
       if (isRedirect(response.status)) {
         await discardBody(response);
-        throw new Error(this.redactor.redact(redirectRefusedMessage(response, 'POST', this.tokenUrl)));
+        throw new RedirectRefusedError(
+          this.redactor.redact(redirectRefusedMessage(response, 'POST', this.tokenUrl)),
+          response.status,
+          requestIdFrom(response.headers),
+        );
       }
       if (!response.ok) {
         await discardBody(response);
@@ -429,6 +433,7 @@ export class PipedriveClient implements UpstreamClient {
           status: response.status,
           url: describeUrl(this.tokenUrl),
           retryAfter: response.headers.get('retry-after') ?? undefined,
+          requestId: requestIdFrom(response.headers),
         });
       }
       return readResponseBody(response, this.maxResponseBytes);
@@ -505,7 +510,11 @@ export class PipedriveClient implements UpstreamClient {
     return this.execute(method === 'GET', method, url, init, async response => {
       if (isRedirect(response.status)) {
         await discardBody(response);
-        throw new Error(this.redactor.redact(redirectRefusedMessage(response, method, url)));
+        throw new RedirectRefusedError(
+          this.redactor.redact(redirectRefusedMessage(response, method, url)),
+          response.status,
+          requestIdFrom(response.headers),
+        );
       }
       if (!response.ok) {
         // The body is Pipedrive's text: it is never read into an error, a result or an audit record.
@@ -514,6 +523,7 @@ export class PipedriveClient implements UpstreamClient {
           status: response.status,
           url: describeUrl(url),
           retryAfter: response.headers.get('retry-after') ?? undefined,
+          requestId: requestIdFrom(response.headers),
         });
       }
       return (await readResponseBody(response, this.maxResponseBytes)) as T;
