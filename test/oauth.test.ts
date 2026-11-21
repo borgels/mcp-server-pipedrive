@@ -19,14 +19,14 @@ function json(body: unknown, status = 200): Response {
 }
 
 /** A Pipedrive stand-in: the token endpoint hands out the given access tokens in turn; the API answers with `api`. */
-function pipedrive(options: { tokens?: string[]; tokenStatus?: number; api?: (url: string, auth: string) => Response; rotate?: string }) {
+function pipedrive(options: { tokens?: string[]; tokenStatus?: number; tokenHeaders?: Record<string, string>; api?: (url: string, auth: string) => Response; rotate?: string }) {
   const calls: Call[] = [];
   const tokens = [...(options.tokens ?? [ACCESS_1, ACCESS_2])];
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, init });
     if (url === TOKEN_URL) {
-      if (options.tokenStatus) return new Response('{"error":"invalid_grant","echo":"' + REFRESH + '"}', { status: options.tokenStatus });
+      if (options.tokenStatus) return new Response('{"error":"invalid_grant","echo":"' + REFRESH + '"}', { status: options.tokenStatus, headers: options.tokenHeaders ?? {} });
       return json({
         access_token: tokens.shift(),
         token_type: 'Bearer',
@@ -277,6 +277,19 @@ describe('OAuth access in the gateway', () => {
     expect(result.isError).toBe(true);
     const first = result.content[0];
     expect(first?.type === 'text' ? first.text : '').toMatch(/^Pipedrive API request failed with HTTP 401/);
+  });
+
+  it('a refused refresh carries its status and the request id as failure metadata', async () => {
+    const id = '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b';
+    for (const status of [400, 401]) {
+      const p = pipedrive({ tokenStatus: status, tokenHeaders: { 'x-request-id': id } });
+      const result = await createPipedriveGateway({ oauth, fetchImpl: p.fetchImpl }).callTool('check_connection', {});
+      expect(result.isError).toBe(true);
+      expect(result.failure).toEqual({ httpStatus: status, requestId: id });
+      expect(JSON.stringify(result)).not.toMatch(/invalid_grant|rrrr-ffff/);
+    }
+    const plain = pipedrive({ tokenStatus: 401, tokenHeaders: { 'x-request-id': 'Jane Doe' } });
+    expect((await createPipedriveGateway({ oauth, fetchImpl: plain.fetchImpl }).callTool('check_connection', {})).failure).toEqual({ httpStatus: 401 });
   });
 
   it('refuses a missing or wrong company address, both kinds of access at once, and another base URL', () => {

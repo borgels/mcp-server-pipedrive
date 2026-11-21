@@ -283,9 +283,14 @@ export function failureFrom(status: unknown, requestId: unknown): FailureMetadat
   return id === undefined ? { httpStatus: status } : { httpStatus: status, requestId: id };
 }
 
-/** The failure metadata of an error: an HTTP error from the upstream API gives its status and request id. */
+/**
+ * The failure metadata of an error: an HTTP error from the upstream API, a refused redirect and a refused renewal at
+ * the token endpoint give their status and request id.
+ */
 export function failureMetadata(error: unknown): FailureMetadata | undefined {
-  if (!(error instanceof PipedriveHttpError) && !(error instanceof RedirectRefusedError)) return undefined;
+  if (!(error instanceof PipedriveHttpError) && !(error instanceof RedirectRefusedError) && !(error instanceof PipedriveTokenError)) {
+    return undefined;
+  }
   return failureFrom(error.status, error.requestId);
 }
 
@@ -495,4 +500,20 @@ export function parseRetryAfterMs(value: string | null | undefined, now: number 
     return undefined;
   }
   return date - now;
+}
+
+/** The token endpoint did not take the app's credentials or the refresh token: our own text, nothing of the answer. */
+export class PipedriveTokenError extends Error {
+  readonly status: number;
+  /** The vendor's own id for the request, when a response header gives one as a UUID or hex id. */
+  readonly requestId?: string;
+  constructor(status: number, requestId?: string) {
+    super(
+      `Pipedrive API request failed with HTTP 401 | Pipedrive did not renew the access (the token endpoint answered ${status}). ` +
+        'The user may have removed the app or not used it for 60 days; the user connects again.',
+    );
+    this.name = 'PipedriveTokenError';
+    this.status = status;
+    this.requestId = vendorRequestId(requestId);
+  }
 }

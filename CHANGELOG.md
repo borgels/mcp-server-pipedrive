@@ -3,7 +3,8 @@
 ## 0.4.0
 
 - Gateway error results carry failure metadata: when the upstream API
-  answered with an HTTP error or a redirect (never followed), the result has
+  answered with an HTTP error or a redirect (never followed), or the token
+  endpoint refused a renewal (400 or 401), the result has
   `failure: { httpStatus, requestId? }`, so a host can count failures by
   status without reading their text. `requestId` is the vendor's own id from
   a response header (`REQUEST_ID_HEADERS`), kept only when it is a hex id of

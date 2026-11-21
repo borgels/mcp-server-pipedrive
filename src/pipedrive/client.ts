@@ -1,5 +1,7 @@
 import { ConfigError, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { PipedriveHttpError, describeUrl, parseRetryAfterMs, RedirectRefusedError, requestIdFrom, SecretRedactor } from '../errors.js';
+import { PipedriveHttpError, PipedriveTokenError, describeUrl, parseRetryAfterMs, RedirectRefusedError, requestIdFrom, SecretRedactor } from '../errors.js';
+
+export { PipedriveTokenError };
 import { USER_AGENT } from '../version.js';
 import { admitsKey } from '../key-admission.js';
 
@@ -128,18 +130,6 @@ const TOKEN_EARLY_RENEWAL_MS = 60_000;
 /** What a token from Pipedrive may consist of: printable ASCII, within a sane length. */
 const TOKEN_TEXT = /^[\x21-\x7e]{16,8192}$/;
 
-/** The token endpoint did not take the app's credentials or the refresh token: our own text, nothing of the answer. */
-export class PipedriveTokenError extends Error {
-  readonly status: number;
-  constructor(status: number) {
-    super(
-      `Pipedrive API request failed with HTTP 401 | Pipedrive did not renew the access (the token endpoint answered ${status}). ` +
-        'The user may have removed the app or not used it for 60 days; the user connects again.',
-    );
-    this.name = 'PipedriveTokenError';
-    this.status = status;
-  }
-}
 
 /**
  * Pipedrive's API host (exact host match, no subdomains). It serves both
@@ -428,7 +418,7 @@ export class PipedriveClient implements UpstreamClient {
       }
       if (!response.ok) {
         await discardBody(response);
-        if (response.status === 400 || response.status === 401) throw new PipedriveTokenError(response.status);
+        if (response.status === 400 || response.status === 401) throw new PipedriveTokenError(response.status, requestIdFrom(response.headers));
         throw new PipedriveHttpError({
           status: response.status,
           url: describeUrl(this.tokenUrl),
