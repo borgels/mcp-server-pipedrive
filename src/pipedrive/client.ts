@@ -1,26 +1,34 @@
-import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { ExampleHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import { ConfigError, readEnvInteger, readEnvString, type Env } from '../config-env.js';
+import { PipedriveHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
 import { USER_AGENT } from '../version.js';
 
-export interface ExampleClientOptions {
-  /** API key. When omitted, read from EXAMPLE_API_KEY in `credentialEnv`. */
-  apiKey?: string;
-  /** API base URL. When omitted, read from EXAMPLE_BASE_URL in `credentialEnv`. */
+/**
+ * The client sends one personal API token in the `x-api-token` header, as
+ * Pipedrive's documentation asks ("The API token must be provided in the
+ * x-api-token header for all requests",
+ * https://pipedrive.readme.io/docs/core-api-concepts-authentication). The
+ * token belongs to one user in one Pipedrive company and carries that user's
+ * permissions. It is never exchanged or renewed, and never put in a URL.
+ */
+export interface PipedriveClientOptions {
+  /** The personal API token. A secret. When omitted, read from PIPEDRIVE_API_TOKEN. */
+  apiToken?: string;
+  /** API base URL (default https://api.pipedrive.com; env PIPEDRIVE_BASE_URL). */
   baseUrl?: string;
   /**
-   * Where omitted credentials (apiKey, baseUrl) are read from. Defaults to
-   * process.env for the standalone server. The gateway passes `{}`, so an
-   * embedded instance only ever uses the credentials it was given.
+   * Where omitted credentials are read from. Defaults to process.env for the
+   * standalone server. The gateway passes `{}`, so an embedded instance only
+   * ever uses the credentials it was given.
    */
   credentialEnv?: Env;
   fetchImpl?: typeof fetch;
-  /** Per-attempt timeout covering headers and body (default 30 s, env EXAMPLE_TIMEOUT_MS). */
+  /** Per-attempt timeout covering headers and body (default 30 s, env PIPEDRIVE_TIMEOUT_MS). */
   timeoutMs?: number;
-  /** Maximum number of concurrent upstream requests from this client (default 4, env EXAMPLE_MAX_CONCURRENCY). */
+  /** Maximum number of concurrent upstream requests from this client (default 4, env PIPEDRIVE_MAX_CONCURRENCY). */
   maxConcurrency?: number;
-  /** Largest successful response body read, in bytes (default 10 MB, env EXAMPLE_MAX_RESPONSE_BYTES). */
+  /** Largest successful response body read, in bytes (default 10 MB, env PIPEDRIVE_MAX_RESPONSE_BYTES). */
   maxResponseBytes?: number;
-  /** Total attempts for idempotent GETs on 429/502/503/504 and transient network errors (default 3). */
+  /** Total attempts for reads on 429/502/503/504 and transient network errors (default 3). */
   maxAttempts?: number;
   /** Base delay of the exponential backoff between retries (default 500 ms). */
   retryBaseDelayMs?: number;
@@ -30,25 +38,48 @@ export interface ExampleClientOptions {
    * the response is returned to the caller instead.
    */
   retryBudgetMs?: number;
-  /** Allow a base URL outside UPSTREAM_HOST_SUFFIXES (env EXAMPLE_ALLOW_CUSTOM_BASE_URL=true). */
-  allowCustomBaseUrl?: boolean;
+  /**
+   * Allow a loopback address (http or https on localhost, 127.0.0.1 or ::1), for local mocks in tests only. There is
+   * no environment variable for it, and the gateway never sets it: no other host than api.pipedrive.com can be
+   * configured, so the token cannot be sent anywhere else.
+   */
+  allowLoopback?: boolean;
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
 }
 
-export type QueryValue = string | number | boolean | null | undefined;
+export type QueryValue = string | number | boolean | null | undefined | readonly (string | number)[];
 
-type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT';
 
-/** Header that carries the API key. Change it to match the upstream API; error text redaction follows it. */
-export const API_KEY_HEADER = 'X-API-Key';
+/** The header that carries the API token; error text redaction follows it. */
+export const API_KEY_HEADER = 'x-api-token';
 
 /**
- * Hosts the API key may be sent to (exact host or any subdomain), e.g.
- * ['api.vendor.com']. Empty: any https host. Loopback http is always allowed
- * for local mocks.
+ * Pipedrive's API host (exact host match, no subdomains). It serves both
+ * `/api/v1` and `/api/v2` for every company and finds the company from the
+ * token, so the token is only ever sent to this one host.
  */
-export const UPSTREAM_HOST_SUFFIXES: readonly string[] = [];
+export const API_HOST = 'api.pipedrive.com';
+export const DEFAULT_BASE_URL = `https://${API_HOST}`;
+
+const ID = '[1-9][0-9]{0,15}';
+
+/**
+ * The only writes the client sends: method and path (relative to the base
+ * URL). Anything else is refused before it is sent, whatever a tool or a
+ * policy says: no DELETE, no merge, no bulk or batch change, nothing on
+ * users, permissions, pipelines, stages, fields, filters, products, mail,
+ * files or webhooks. New and changed deals, persons, organizations and
+ * activities go to API v2; notes exist only in API v1. The client has no
+ * delete method at all.
+ */
+export const ALLOWED_WRITES: ReadonlyArray<{ method: 'POST' | 'PATCH' | 'PUT'; path: RegExp }> = [
+  { method: 'POST', path: /^\/api\/v2\/(deals|persons|organizations|activities)$/ },
+  { method: 'PATCH', path: new RegExp(`^/api/v2/(deals|persons|organizations|activities)/${ID}$`) },
+  { method: 'POST', path: /^\/api\/v1\/notes$/ },
+  { method: 'PUT', path: new RegExp(`^/api/v1/notes/${ID}$`) },
+];
 
 export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_RESPONSE_BYTES_LIMIT = 100 * 1024 * 1024;
@@ -56,7 +87,6 @@ const MAX_RESPONSE_BYTES_LIMIT = 100 * 1024 * 1024;
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 /** Largest delay accepted by Node timers. */
 const MAX_TIMER_MS = 2_147_483_647;
-/** Error codes (on `error.cause`) of connection-level failures worth retrying. */
 /** System error codes a network error may name: a fixed list, so no other text from a cause is ever shown. */
 const SHOWN_NETWORK_CODES: ReadonlySet<string> = new Set([
   'ECONNRESET',
@@ -79,6 +109,7 @@ const SHOWN_NETWORK_CODES: ReadonlySet<string> = new Set([
   'ERR_TLS_CERT_ALTNAME_INVALID',
 ]);
 
+/** Error codes (on `error.cause`) of connection-level failures worth retrying. */
 const TRANSIENT_NETWORK_CODES = new Set([
   'ECONNRESET',
   'ECONNREFUSED',
@@ -96,21 +127,18 @@ const TRANSIENT_NETWORK_CODES = new Set([
 ]);
 
 /**
- * The client as handed to tool handlers. Read-only tools get a view whose
- * non-GET methods throw (see readOnlyClient), so the write gate does not
- * depend on tool annotations alone.
+ * The client as handed to tool handlers. Read-only tools get a view without
+ * post and patch (see readOnlyClient), so the write gate does not depend on
+ * tool annotations alone.
  */
 export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
-  post<T>(path: string, body?: unknown, query?: Record<string, QueryValue>): Promise<T>;
+  post<T>(path: string, body?: unknown): Promise<T>;
   patch<T>(path: string, body?: unknown): Promise<T>;
+  put<T>(path: string, body?: unknown): Promise<T>;
 }
 
-/**
- * A view of the client that only allows GET. A read-only tool that needs a
- * POST (e.g. a search endpoint that takes a body) should get an explicit,
- * named method here rather than the full client.
- */
+/** A view of the client that only reads: GET. */
 export function readOnlyClient(client: UpstreamClient, toolName: string): UpstreamClient {
   const refuse = (method: string) => async () => {
     throw new Error(`Read-only tool ${toolName} attempted an upstream ${method}; refused.`);
@@ -119,26 +147,27 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     get: (path, query) => client.get(path, query),
     post: refuse('POST'),
     patch: refuse('PATCH'),
+    put: refuse('PUT'),
   };
 }
 
 /**
- * Client for the upstream API. Authenticates with a single API key header.
+ * Client for the Pipedrive API. The API token is sent in the x-api-token header.
  *
- * Redirects are never followed, so the key cannot be forwarded to another
- * origin. Idempotent GETs are retried with backoff on throttling, gateway
- * errors and transient network failures; other methods are never retried.
- * A missing API key or base URL only fails when a request is made, so the
- * tool list can be read without credentials.
+ * Redirects are never followed, so the token can never be forwarded to
+ * another origin. Reads (GET) are retried with backoff on
+ * throttling, gateway errors and transient network failures; writes are never
+ * retried. A missing token only fails when a request is made, so the tool
+ * list can be read without one.
  *
- * Each client owns a SecretRedactor holding its own key and key header;
- * errors raised by the client, and the audit and tool results of calls
- * made through it, are redacted with it.
+ * Each client owns a SecretRedactor holding its token; errors raised by the
+ * client, and the audit and tool results of calls made through it, are
+ * redacted with it.
  */
-export class ExampleClient implements UpstreamClient {
+export class PipedriveClient implements UpstreamClient {
   readonly redactor: SecretRedactor;
-  private readonly apiKey?: string;
-  readonly baseUrl?: string;
+  private readonly apiToken?: string;
+  readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
@@ -148,31 +177,23 @@ export class ExampleClient implements UpstreamClient {
   private readonly semaphore: Semaphore;
   private readonly sleep: (ms: number) => Promise<void>;
 
-  constructor(options: ExampleClientOptions = {}) {
+  constructor(options: PipedriveClientOptions = {}) {
     const credentialEnv = options.credentialEnv ?? process.env;
-    this.apiKey = options.apiKey ?? readEnvString('EXAMPLE_API_KEY', credentialEnv);
-    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.apiKey);
-    const baseUrl = options.baseUrl ?? readEnvString('EXAMPLE_BASE_URL', credentialEnv);
-    if (baseUrl !== undefined) {
-      this.baseUrl = trimTrailingSlash(baseUrl);
-      assertSafeBaseUrl(
-        this.baseUrl,
-        options.allowCustomBaseUrl ?? readEnvBoolean('EXAMPLE_ALLOW_CUSTOM_BASE_URL', false),
-      );
-    }
+    this.apiToken = options.apiToken ?? readEnvString('PIPEDRIVE_API_TOKEN', credentialEnv);
+    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.apiToken);
+    this.baseUrl = trimTrailingSlash(options.baseUrl ?? readEnvString('PIPEDRIVE_BASE_URL', credentialEnv) ?? DEFAULT_BASE_URL);
+    assertSafeUrl(this.baseUrl, API_HOST, 'PIPEDRIVE_BASE_URL', options.allowLoopback === true);
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'EXAMPLE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
+    this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'PIPEDRIVE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
     this.maxResponseBytes = intOption(
       'maxResponseBytes',
       options.maxResponseBytes,
-      'EXAMPLE_MAX_RESPONSE_BYTES',
+      'PIPEDRIVE_MAX_RESPONSE_BYTES',
       DEFAULT_MAX_RESPONSE_BYTES,
       1,
       MAX_RESPONSE_BYTES_LIMIT,
     );
-    this.semaphore = new Semaphore(
-      intOption('maxConcurrency', options.maxConcurrency, 'EXAMPLE_MAX_CONCURRENCY', 4, 1, 64),
-    );
+    this.semaphore = new Semaphore(intOption('maxConcurrency', options.maxConcurrency, 'PIPEDRIVE_MAX_CONCURRENCY', 4, 1, 64));
     this.maxAttempts = intOption('maxAttempts', options.maxAttempts, undefined, 3, 1, 10);
     this.retryBaseDelayMs = intOption('retryBaseDelayMs', options.retryBaseDelayMs, undefined, 500, 0, 60_000);
     this.retryBudgetMs = intOption('retryBudgetMs', options.retryBudgetMs, undefined, 10_000, 0, 600_000);
@@ -183,83 +204,81 @@ export class ExampleClient implements UpstreamClient {
     return this.request<T>('GET', this.buildUrl(path, query));
   }
 
-  async post<T>(path: string, body?: unknown, query?: Record<string, QueryValue>): Promise<T> {
-    return this.request<T>('POST', this.buildUrl(path, query), body);
+  async post<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>('POST', this.buildUrl(path), body);
   }
 
   async patch<T>(path: string, body?: unknown): Promise<T> {
     return this.request<T>('PATCH', this.buildUrl(path), body);
   }
 
+  async put<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>('PUT', this.buildUrl(path), body);
+  }
+
+  /** A query value that is a list is sent as one comma-separated value, as Pipedrive takes lists (ids). */
   buildUrl(path: string, query?: Record<string, QueryValue>): string {
-    if (!this.baseUrl) {
-      throw new Error('Missing EXAMPLE_BASE_URL. Set it in the MCP server environment.');
-    }
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = new URL(`${this.baseUrl}${normalizedPath}`);
-
     for (const [key, value] of Object.entries(query ?? {})) {
-      if (value === undefined || value === null || value === '') {
-        continue;
-      }
-      url.searchParams.set(key, String(value));
+      if (value === undefined || value === null || value === '') continue;
+      url.searchParams.set(key, Array.isArray(value) ? value.join(',') : String(value));
     }
-
     return url.toString();
   }
 
-  private headers(): Record<string, string> {
-    if (!this.apiKey) {
-      throw new Error('Missing EXAMPLE_API_KEY. Set it in the MCP server environment.');
+  private async request<T>(method: HttpMethod, url: string, body?: unknown): Promise<T> {
+    if (method !== 'GET') {
+      // The fixed list of writes: anything else is refused before the token is put in a header.
+      const path = new URL(url).pathname.slice(new URL(`${this.baseUrl}/`).pathname.length - 1);
+      const allowed = ALLOWED_WRITES.some(entry => entry.method === method && entry.path.test(path));
+      if (!allowed) {
+        throw new Error(`Refused: ${method} to that Pipedrive path is not among the requests this server sends.`);
+      }
     }
-    return {
+    if (!this.apiToken) throw new Error('Missing PIPEDRIVE_API_TOKEN. Set it in the MCP server environment.');
+    const headers: Record<string, string> = {
       Accept: 'application/json',
       'User-Agent': USER_AGENT,
-      [API_KEY_HEADER]: this.apiKey,
+      [API_KEY_HEADER]: this.apiToken,
     };
-  }
-
-  private async request<T>(method: HttpMethod, url: string, body?: unknown): Promise<T> {
-    const headers = this.headers();
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-
-    return this.execute(method, url, init, async response => {
+    return this.execute(method === 'GET', method, url, init, async response => {
       if (isRedirect(response.status)) {
         await discardBody(response);
         throw new Error(this.redactor.redact(redirectRefusedMessage(response, method, url)));
       }
-
       if (!response.ok) {
-        // The body is the vendor's text: it is never read into an error, a result or an audit record.
+        // The body is Pipedrive's text: it is never read into an error, a result or an audit record.
         await discardBody(response);
-        throw new ExampleHttpError({
+        throw new PipedriveHttpError({
           status: response.status,
           url: describeUrl(url),
           retryAfter: response.headers.get('retry-after') ?? undefined,
         });
       }
-
       return (await readResponseBody(response, this.maxResponseBytes)) as T;
     });
   }
 
   /**
    * Run one logical request: limit concurrency, apply the timeout, and retry
-   * idempotent GETs on retryable statuses and transient network errors
+   * reads on retryable statuses and transient network errors
    * within the retry budget. `handle` runs while the concurrency slot is
    * held, so body reads count against it.
    */
   private async execute<R>(
+    retryable: boolean,
     method: HttpMethod,
     url: string,
     init: RequestInit,
     handle: (response: Response) => Promise<R>,
   ): Promise<R> {
-    const maxAttempts = method === 'GET' ? this.maxAttempts : 1;
+    const maxAttempts = retryable ? this.maxAttempts : 1;
     let slept = 0;
 
     for (let attempt = 1; ; attempt += 1) {
@@ -325,12 +344,12 @@ export class ExampleClient implements UpstreamClient {
   // Our own words with the method only: the address is configuration and is not quoted.
   private transportError(method: HttpMethod, _url: string, error: unknown): Error {
     if (isTimeoutError(error)) {
-      return new Error(this.redactor.redact(`Example API request timed out after ${this.timeoutMs} ms (${method}).`));
+      return new Error(this.redactor.redact(`Pipedrive API request timed out after ${this.timeoutMs} ms (${method}).`));
     }
     // Only a system error code (ECONNREFUSED, ENOTFOUND, ...) from the cause, never its message.
     const code = (error instanceof Error ? (error.cause as { code?: unknown } | undefined)?.code : undefined) ?? undefined;
     const shown = typeof code === 'string' && SHOWN_NETWORK_CODES.has(code) ? ` (${code})` : '';
-    return new Error(this.redactor.redact(`Network error calling the Example API (${method})${shown}.`), { cause: error });
+    return new Error(this.redactor.redact(`Network error calling the Pipedrive API (${method})${shown}.`), { cause: error });
   }
 }
 
@@ -388,8 +407,8 @@ function isRedirect(status: number): boolean {
 /** The redirect's Location is the vendor's text and is never quoted; only the status and our own request. */
 function redirectRefusedMessage(response: Response, method: HttpMethod, _url: string): string {
   return (
-    `Example API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
-    'redirects are not followed. Check EXAMPLE_BASE_URL.'
+    `Pipedrive API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
+    'redirects are not followed. Check PIPEDRIVE_BASE_URL.'
   );
 }
 
@@ -469,7 +488,7 @@ async function readResponseBody(response: Response, maxBytes: number): Promise<u
   const declared = Number(response.headers.get('content-length') ?? 0);
   if (Number.isFinite(declared) && declared > maxBytes) {
     await discardBody(response);
-    throw new Error(`Example API response of ${declared} bytes exceeds the ${maxBytes} byte limit (EXAMPLE_MAX_RESPONSE_BYTES).`);
+    throw new Error(`Pipedrive API response of ${declared} bytes exceeds the ${maxBytes} byte limit (PIPEDRIVE_MAX_RESPONSE_BYTES).`);
   }
   let read: { bytes: Uint8Array; exceeded: boolean };
   try {
@@ -480,11 +499,11 @@ async function readResponseBody(response: Response, maxBytes: number): Promise<u
     if (isTimeoutError(error) || isTransientNetworkError(error)) {
       throw error;
     }
-    throw new Error('The Example API response could not be read.');
+    throw new Error('The Pipedrive API response could not be read.');
   }
   const { bytes, exceeded } = read;
   if (exceeded) {
-    throw new Error(`Example API response exceeds the ${maxBytes} byte limit (EXAMPLE_MAX_RESPONSE_BYTES).`);
+    throw new Error(`Pipedrive API response exceeds the ${maxBytes} byte limit (PIPEDRIVE_MAX_RESPONSE_BYTES).`);
   }
   const text = new TextDecoder().decode(bytes);
   if (!text) {
@@ -509,43 +528,27 @@ function trimTrailingSlash(value: string): string {
   return value.slice(0, end);
 }
 
-function assertSafeBaseUrl(baseUrl: string, allowCustomHost: boolean): void {
+/**
+ * A URL a token may be sent to: https on exactly `host` (Pipedrive's API host), no credentials, query or fragment.
+ * A loopback address only with allowLoopback (tests). No other host can be configured. The value is never quoted: it
+ * is configuration.
+ */
+function assertSafeUrl(value: string, host: string, name: string, allowLoopback: boolean): void {
   let parsed: URL;
   try {
-    parsed = new URL(baseUrl);
+    parsed = new URL(value);
   } catch {
-    throw new ConfigError('EXAMPLE_BASE_URL is not a valid URL.');
+    throw new ConfigError(`${name} is not a valid URL.`);
   }
-
-  if (parsed.username || parsed.password || baseUrl.includes('?') || baseUrl.includes('#')) {
-    throw new ConfigError('EXAMPLE_BASE_URL must not contain credentials, a query string or a fragment.');
+  if (parsed.username || parsed.password || value.includes('?') || value.includes('#')) {
+    throw new ConfigError(`${name} must not contain credentials, a query string or a fragment.`);
   }
-
-  if (isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) {
-    return;
-  }
-
+  if (allowLoopback && isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) return;
   if (parsed.protocol !== 'https:') {
-    throw new ConfigError(
-      // The scheme is not quoted: it is part of a configuration value.
-      'Refusing to send the API key over a scheme other than https://. Use https:// (loopback http:// is allowed for local mocks).',
-    );
+    throw new ConfigError(`Refusing to send a token over a scheme other than https://. ${name} must use https://.`);
   }
-
-  const host = parsed.hostname.toLowerCase();
-  if (
-    UPSTREAM_HOST_SUFFIXES.length === 0 ||
-    allowCustomHost ||
-    UPSTREAM_HOST_SUFFIXES.some(suffix => host === suffix || host.endsWith(`.${suffix}`))
-  ) {
-    return;
-  }
-
-  // The host is not quoted: it is a configuration value.
-  throw new ConfigError(
-    `Refusing to send the API key to that host: EXAMPLE_BASE_URL must be on ${UPSTREAM_HOST_SUFFIXES.join(', ')}. ` +
-      'Set EXAMPLE_ALLOW_CUSTOM_BASE_URL=true to allow another host.',
-  );
+  if (parsed.hostname.toLowerCase() === host) return;
+  throw new ConfigError(`Refusing to send a token to that host: ${name} must be on ${host}.`);
 }
 
 function isLocalHost(hostname: string): boolean {

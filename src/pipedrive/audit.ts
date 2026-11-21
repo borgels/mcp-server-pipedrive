@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { accessSync, constants, statSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { ExampleHttpError, formatUnknownError, redactDeep, redactSecrets, type SecretRedactor } from '../errors.js';
+import { PipedriveHttpError, formatUnknownError, redactDeep, redactSecrets, type SecretRedactor } from '../errors.js';
 import { STDERR_WITHHELD, withheldAuditRecord } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import { ConfigError, readEnvString } from '../config-env.js';
@@ -33,10 +33,10 @@ export function auditErrorSummary(
   error: unknown,
   redactor?: SecretRedactor,
 ): { httpStatus?: number; message: string } {
-  if (error instanceof ExampleHttpError) {
+  if (error instanceof PipedriveHttpError) {
     return {
       httpStatus: error.status,
-      message: `Example API request failed with HTTP ${error.status}`,
+      message: `Pipedrive API request failed with HTTP ${error.status}`,
     };
   }
   const message = formatUnknownError(error, redactor);
@@ -50,12 +50,12 @@ export function newRequestId(): string {
 }
 
 /**
- * Startup check: when EXAMPLE_AUDIT_LOG is set, its directory must exist and
+ * Startup check: when PIPEDRIVE_AUDIT_LOG is set, its directory must exist and
  * be writable (and the file, if it exists, writable), so a typo fails at
  * startup rather than refusing every write tool call later.
  */
 export function assertAuditLogWritable(): void {
-  const auditPath = readEnvString('EXAMPLE_AUDIT_LOG');
+  const auditPath = readEnvString('PIPEDRIVE_AUDIT_LOG');
   if (!auditPath) {
     return;
   }
@@ -63,14 +63,14 @@ export function assertAuditLogWritable(): void {
     const existing = statSync(auditPath, { throwIfNoEntry: false });
     accessSync(existing ? auditPath : dirname(auditPath), constants.W_OK);
   } catch {
-    throw new ConfigError('EXAMPLE_AUDIT_LOG is not writable.');
+    throw new ConfigError('PIPEDRIVE_AUDIT_LOG is not writable.');
   }
 }
 
 /**
- * Append one JSON line to EXAMPLE_AUDIT_LOG (no-op when unset). Under a
+ * Append one JSON line to PIPEDRIVE_AUDIT_LOG (no-op when unset). Under a
  * host's InstancePolicy the record goes to the policy's `audit` sink instead
- * (no-op without one), and EXAMPLE_AUDIT_LOG is not read.
+ * (no-op without one), and PIPEDRIVE_AUDIT_LOG is not read.
  *
  * By default a failing audit sink is reported on stderr and does not change
  * the tool result: after a call has run, surfacing an error would invite a
@@ -85,7 +85,7 @@ export async function writeAuditEvent(
 ): Promise<void> {
   const hosted = currentInstancePolicy();
   const sink = hosted?.audit;
-  const auditPath = hosted ? undefined : readEnvString('EXAMPLE_AUDIT_LOG');
+  const auditPath = hosted ? undefined : readEnvString('PIPEDRIVE_AUDIT_LOG');
   if (!sink && !auditPath) {
     return;
   }
@@ -125,10 +125,10 @@ export async function writeAuditEvent(
       // Details (path, OS error) go to stderr only, not to the caller.
       const tool = formatUnknownError(event.tool, redactor);
       // The whole line, prefix included, through the redactor and then the sink check.
-      stderrLine(redactSecrets(`[example-mcp] audit log write failed, refusing ${tool}: ${formatUnknownError(error, redactor)}`, redactor));
+      stderrLine(redactSecrets(`[pipedrive-mcp] audit log write failed, refusing ${tool}: ${formatUnknownError(error, redactor)}`, redactor));
       throw new Error(`Audit log is not writable on this instance; ${tool} was not run.`);
     }
-    stderrLine(redactSecrets(`[example-mcp] audit log write failed: ${formatUnknownError(error, redactor)}`, redactor));
+    stderrLine(redactSecrets(`[pipedrive-mcp] audit log write failed: ${formatUnknownError(error, redactor)}`, redactor));
   }
 }
 
@@ -136,14 +136,43 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
   return { httpStatus: summary.httpStatus, error: summary.message };
 }
 
-/** Identifier fields logged in clear text: they are opaque ids, not secrets. Extend per tool. */
-const ID_FIELDS = ['itemId'] as const;
+/**
+ * Fields logged in clear text: Pipedrive ids, internal keys (record kind,
+ * activity type, deal status, currency code), dates, flags and paging.
+ * Input is validated before it is audited.
+ */
+const ID_FIELDS = [
+  'dealId',
+  'personId',
+  'orgId',
+  'activityId',
+  'noteId',
+  'recordId',
+  'on',
+  'ownerId',
+  'pipelineId',
+  'stageId',
+  'status',
+  'currency',
+  'type',
+  'done',
+  'activeOnly',
+  'dueDate',
+  'expectedCloseDate',
+  'updatedSince',
+  'limit',
+  'cursor',
+  'start',
+] as const;
 
-/** Free-text fields are hashed so user-written text does not land in the log. */
-const FREE_TEXT_FIELDS = ['name', 'query'] as const;
+/**
+ * No free text is logged, not even hashed: a search is a name, an e-mail
+ * address or a phone number; a note or a title is written by a person.
+ */
+const FREE_TEXT_FIELDS = [] as const;
 
-/** Write payload objects: only their field names are logged. */
-const PAYLOAD_FIELDS = ['body', 'patch'] as const;
+/** Lists logged as a count only. None today. */
+const LIST_FIELDS = [] as const;
 
 /** Build the audit `target` for a tool input. Values not listed above are not logged. */
 export function auditTarget(input: unknown): Record<string, unknown> | undefined {
@@ -166,10 +195,9 @@ export function auditTarget(input: unknown): Record<string, unknown> | undefined
     }
   }
 
-  for (const field of PAYLOAD_FIELDS) {
-    const payload = value[field];
-    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-      target[`${field}Fields`] = Object.keys(payload).sort();
+  for (const field of LIST_FIELDS) {
+    if (Array.isArray(value[field])) {
+      target[`${field}Count`] = (value[field] as unknown[]).length;
     }
   }
 

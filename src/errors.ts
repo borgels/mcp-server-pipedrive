@@ -49,9 +49,10 @@ function headerPattern(name: string): RegExp {
 /** Patterns that are always applied: credential-shaped key/value pairs. They hold no secret values. */
 const BASE_PATTERNS: readonly RegExp[] = [
   headerPattern('x-api-key'),
+  headerPattern('x-api-token'),
   // Any scheme word (Bearer, Basic, Token, ...) followed by the credentials.
   /["']?authorization["']?\s*[:=]\s*["']?(?:[a-z][\w-]*\s+)?[^"',\s}]+/gi,
-  /(apiKey|EXAMPLE_API_KEY|api_key|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
+  /(accessToken|apiToken|api_token|PIPEDRIVE_API_TOKEN|refreshToken|refresh_token|clientSecret|client_secret|apiKey|access_token|api_key|password)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
 ];
 
 /**
@@ -62,7 +63,21 @@ const BASE_PATTERNS: readonly RegExp[] = [
  * runs several tenants in one process never mixes their keys, and a tenant's
  * key is released with its instance. There is no process-wide registry.
  */
+/**
+ * The URL-encoded form of a value. encodeURIComponent throws on a lone
+ * surrogate (text that is not valid UTF-16); such a value is encoded as its
+ * well-formed copy instead, so registering a secret never throws.
+ */
+function uriForm(value: string): string {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    return encodeURIComponent(value.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+  }
+}
+
 export class SecretRedactor {
+  private readonly values = new Set<string>();
   private readonly secrets = new Set<string>();
   private readonly fragments = new Set<string>();
   private readonly patterns: RegExp[] = [...BASE_PATTERNS];
@@ -72,12 +87,28 @@ export class SecretRedactor {
     if (!value || value.length < MIN_SECRET_LENGTH) {
       return this;
     }
-    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
+    this.values.add(value);
+    for (const form of new Set([value, uriForm(value), JSON.stringify(value).slice(1, -1)])) {
       this.secrets.add(form);
       for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) {
         this.fragments.add(form.slice(i, i + FRAGMENT_LENGTH));
       }
     }
+    return this;
+  }
+
+  /**
+   * Stop redacting a value that is no longer a secret of this instance (an
+   * access token that was replaced). The other secrets, and their pieces,
+   * stay.
+   */
+  removeSecret(value: string): this {
+    if (!this.values.delete(value)) return this;
+    const remaining = [...this.values];
+    this.values.clear();
+    this.secrets.clear();
+    this.fragments.clear();
+    for (const secret of remaining) this.addSecret(secret);
     return this;
   }
 
@@ -157,19 +188,23 @@ function applyPatterns(value: string, patterns: readonly RegExp[]): string {
   );
 }
 
-/** Our own guidance per HTTP status. Replace or extend with the vendor's documented statuses. */
+/** Our own guidance per HTTP status. Nothing of the response body (Pipedrive's problem details) is used. */
 const STATUS_HINTS: Record<number, string> = {
-  401: 'The API key was rejected (invalid or expired). The server operator must renew EXAMPLE_API_KEY.',
-  403: 'The API key has no access to this resource. Retrying will not help.',
-  404: 'The object was not found, or the API key has no access to it. Check the ids.',
-  429: 'The upstream API is throttling requests. Wait and retry later.',
-};
+  400: 'Pipedrive refused the input (a value Pipedrive does not accept, e.g. an unknown stage, owner or activity type, or a field missing). Check the ids and values. Nothing was changed.',
+  401: 'Pipedrive did not accept the API token. It may have been changed or the user removed; the user copies the current token from Personal preferences, API in Pipedrive.',
+  402: 'Pipedrive refused: the company has no active subscription that allows this.',
+  403: 'Pipedrive refused access: the user whose token this is may not see or change this, or the company does not let the user use the API. Retrying will not help.',
+  404: 'The record was not found, or the user whose token this is cannot see it. Check the ids.',
+  410: 'The record has been deleted in Pipedrive.',
+  422: 'Pipedrive refused the change (for example a field it does not accept here). Nothing was changed.',
+  429: 'Pipedrive is throttling requests (the limit per two seconds, or the daily budget of the company). Wait and retry later.',
+}
 
 /**
  * An HTTP error from the upstream API. It keeps the status and the parsed
  * Retry-After, nothing from the response body: the message is our own.
  */
-export class ExampleHttpError extends Error {
+export class PipedriveHttpError extends Error {
   readonly status: number;
   readonly url: string;
   /** Seconds to wait, parsed from Retry-After; undefined when absent or malformed. */
@@ -177,7 +212,7 @@ export class ExampleHttpError extends Error {
 
   constructor(input: { status: number; url: string; retryAfter?: string }) {
     super(httpErrorMessage(input.status, input.retryAfter));
-    this.name = 'ExampleHttpError';
+    this.name = 'PipedriveHttpError';
     this.status = input.status;
     this.url = describeUrl(input.url);
     const retryMs = parseRetryAfterMs(input.retryAfter);
@@ -189,7 +224,7 @@ export class ExampleHttpError extends Error {
 export function httpErrorMessage(status: number, retryAfter?: string): string {
   const retryMs = parseRetryAfterMs(retryAfter);
   return [
-    `Example API request failed with HTTP ${status}`,
+    `Pipedrive API request failed with HTTP ${status}`,
     Object.hasOwn(STATUS_HINTS, status) ? STATUS_HINTS[status] : undefined,
     retryMs === undefined ? undefined : `retry-after=${Math.ceil(retryMs / 1000)}s`,
   ]
@@ -268,13 +303,13 @@ export function redactDeep(value: unknown, redactor?: SecretRedactor, depth = 0)
  * fixed text. Never the error's own message.
  */
 export function nestedFailureText(error: unknown): string {
-  if (error instanceof ExampleHttpError) {
-    return `Example API request failed with HTTP ${error.status}`;
+  if (error instanceof PipedriveHttpError) {
+    return `Pipedrive API request failed with HTTP ${error.status}`;
   }
   if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-    return 'Example API request timed out.';
+    return 'Pipedrive API request timed out.';
   }
-  return 'Example API request failed.';
+  return 'Pipedrive API request failed.';
 }
 
 /** Keys whose value is a failure context: anything inside that carries an error or a message is a failure. */
@@ -289,8 +324,8 @@ function failureEntry(value: unknown): { status?: number; message: string } {
   const status =
     typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>).status : undefined;
   return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
-    ? { status, message: `Example API request failed with HTTP ${status}` }
-    : { message: 'Example API request failed.' };
+    ? { status, message: `Pipedrive API request failed with HTTP ${status}` }
+    : { message: 'Pipedrive API request failed.' };
 }
 
 /** A failure list: every element (an object with any fields, a text, a list) becomes a failureEntry. */
@@ -335,8 +370,8 @@ export function nestedFailuresAsStatus(value: unknown, depth = 0, context = fals
   const present = (field: string) => Object.hasOwn(record, field) && record[field] !== null && record[field] !== undefined;
   if (failedStatus || present('error') || (context && FAILURE_FIELDS.some(present))) {
     return failedStatus
-      ? { status, error: `Example API request failed with HTTP ${status}` }
-      : { error: 'Example API request failed.' };
+      ? { status, error: `Pipedrive API request failed with HTTP ${status}` }
+      : { error: 'Pipedrive API request failed.' };
   }
   return Object.fromEntries(
     Object.entries(record).map(([key, entry]) => [

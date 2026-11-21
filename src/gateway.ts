@@ -1,50 +1,70 @@
 import { z } from 'zod/v4';
-import { UNTRUSTED_CONTENT_NOTE } from './example/annotations.js';
-import { ExampleClient, type ExampleClientOptions } from './example/client.js';
+import { UNTRUSTED_CONTENT_NOTE } from './pipedrive/annotations.js';
+import { DEFAULT_BASE_URL, PipedriveClient, type PipedriveClientOptions } from './pipedrive/client.js';
 import {
   isToolDisabled,
   resolveInstancePolicy,
   runInCallScope,
   TOOL_PREFIX,
   type InstancePolicy,
-} from './example/policy.js';
+} from './pipedrive/policy.js';
 import { ConfigError } from './config-env.js';
 import { formatUnknownError, redactDeep, SecretRedactor } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
   auditRejectedCall,
-  EXAMPLE_TOOLS,
+  changedInput,
+  PIPEDRIVE_TOOLS,
   executeTool,
   findTool,
+  logFieldValue,
+  validateCall,
   validateStartupConfig,
+  type PipedriveChangeAction,
+  type PipedriveChangeRecord,
+  type PipedriveChangeSpec,
   type CallContext,
   type ToolDefinition,
   type UpstreamOperation,
-} from './tools/example.js';
+} from './tools/pipedrive.js';
 
 /**
  * Embeddable entry point (package export `./gateway`): an embedding host,
  * such as an MCP gateway that does its own per-user authorization, lists
  * `tools` and invokes `callTool`. Tool definitions, input validation,
  * instance policy and audit are shared with the MCP server in
- * src/tools/example.ts.
+ * src/tools/pipedrive.ts.
  *
- * Several gateway instances (for example one per tenant) can run in one
- * process. Each instance uses only the credentials passed to
- * createExampleGateway (never EXAMPLE_API_KEY or EXAMPLE_BASE_URL from the
- * environment) and redacts errors with its own secrets only.
+ * One instance per Pipedrive company and user (one API token). Several instances
+ * can run in one process. Each instance uses only the token passed to
+ * createPipedriveGateway (never PIPEDRIVE_API_TOKEN or PIPEDRIVE_BASE_URL from
+ * the environment) and redacts errors with its own secrets only.
  *
  * Instance policy (writes, disabled tools, audit) comes from the host when it
- * passes `policy`: that instance then reads none of EXAMPLE_ENABLE_WRITES,
- * EXAMPLE_DISABLED_TOOLS, EXAMPLE_AUDIT_LOG or EXAMPLE_ALLOW_CUSTOM_BASE_URL,
+ * passes `policy`: that instance then reads none of PIPEDRIVE_ENABLE_WRITES,
+ * PIPEDRIVE_DISABLED_TOOLS or PIPEDRIVE_AUDIT_LOG,
  * so two tenants in one process can have different settings. Without
  * `policy` the instance uses the environment, as the MCP server does. Limits
  * (timeouts, retries) are still read from the environment and apply to every
  * instance.
+ *
+ * What no policy can turn on: a request outside the client's fixed list of
+ * writes (src/pipedrive/client.ts, ALLOWED_WRITES): a new or changed deal,
+ * person, organization or activity (API v2), and a new or changed note (API
+ * v1). There is no DELETE, merge or bulk change, and nothing sends e-mail or
+ * invitations or touches users, permissions, pipelines, stages, fields,
+ * filters, products, files or webhooks.
  */
 
-export type { AuditSink, InstancePolicy } from './example/policy.js';
+export type { AuditSink, InstancePolicy } from './pipedrive/policy.js';
+export type {
+  PipedriveChangeAction,
+  PipedriveChangeRecord,
+  PipedriveChangeSpec,
+  PipedriveLogField,
+  PipedriveLogFieldType,
+} from './tools/pipedrive.js';
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -95,13 +115,25 @@ export interface GatewayToolCatalogEntry {
    * (`broad`), false unless a tool declares it.
    */
   readonly broad: boolean;
+  /**
+   * True for a tool a person should confirm outside the chat before it runs.
+   * False for every tool here: none moves money.
+   */
+  readonly requiresConfirmation: boolean;
+  /**
+   * Write tools only: what the change does, for a host that logs a change
+   * before it is sent. `logFields` are the input fields that identify it,
+   * each with the one type its value must have (Pipedrive ids, internal keys, dates,
+   * counts, flags, currency codes and the names of changed fields in clear;
+   * never names, amounts or free text).
+   * `resolvePipedriveChange` returns their values.
+   */
+  readonly change?: PipedriveChangeSpec;
 }
 
-export interface ExampleGatewayOptions extends Omit<ExampleClientOptions, 'apiKey' | 'baseUrl' | 'credentialEnv'> {
-  /** API key of this instance. Required; never read from the environment. */
-  apiKey: string;
-  /** API base URL of this instance. Required; never read from the environment. */
-  baseUrl: string;
+export interface PipedriveGatewayOptions extends Omit<PipedriveClientOptions, 'apiToken' | 'credentialEnv' | 'allowLoopback'> {
+  /** The personal API token of a Pipedrive user. Required; a secret; never read from the environment. */
+  apiToken: string;
   /**
    * Instance policy from the host. When given, the instance reads no policy
    * or audit variables from the environment (see InstancePolicy). A host
@@ -152,106 +184,217 @@ function deepFreeze<T>(value: T): T {
 }
 
 /** All tools, as gateway definitions (names without the prefix). */
-export const exampleGatewayTools: GatewayToolDefinition[] = EXAMPLE_TOOLS.map(toGatewayDefinition);
+export const pipedriveGatewayTools: GatewayToolDefinition[] = PIPEDRIVE_TOOLS.map(toGatewayDefinition);
 
 /**
  * The tool catalog: every tool with its gateway definition and the upstream
  * requests it may make. Generated from the same tool table as the MCP server
- * and `exampleGatewayTools`, and deeply frozen. Hosts can use it to build
+ * and `pipedriveGatewayTools`, and deeply frozen. Hosts can use it to build
  * their own permission model without creating a gateway instance.
  */
-export const exampleToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
-  EXAMPLE_TOOLS.map(tool => ({
+export const pipedriveToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
+  PIPEDRIVE_TOOLS.map(tool => ({
     ...toGatewayDefinition(tool),
     upstream: tool.upstream.map(operation => ({ ...operation })),
     broad: tool.broad === true,
+    requiresConfirmation: tool.requiresConfirmation === true,
+    ...(tool.change
+      ? { change: { ...tool.change, logFields: tool.change.logFields.map(field => ({ ...field })) } }
+      : {}),
   })),
 );
 
-function requiredCredential(options: ExampleGatewayOptions, name: 'apiKey' | 'baseUrl'): string {
-  const value: unknown = (options as Partial<ExampleGatewayOptions> | undefined)?.[name];
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw new ConfigError(
-      `createExampleGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
+/** What a write tool call will change, resolved from its input before anything is sent. */
+export interface PipedriveChange {
+  readonly tool: string;
+  readonly action: PipedriveChangeAction;
+  readonly record: PipedriveChangeRecord;
+  readonly movesMoney: false;
+  readonly requiresConfirmation: boolean;
+  /**
+   * The values of the tool's `logFields` that are present and have their
+   * field's type. A value of the wrong type is left out, so a name or a free
+   * text can never reach the values.
+   */
+  readonly values: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type PipedriveChangeResolution =
+  | { readonly ok: true; readonly change: PipedriveChange }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Resolves what a write tool call will change, for a host that logs the
+ * change before the call runs: the action, the record kind and the values of
+ * the tool's `logFields`: Pipedrive ids, dates and keys in clear, never a
+ * name or a comment. A field of type `pseudonym` would come back only as
+ * HMAC-SHA-256 with `options.pseudonymKey` (else SHA-256). Refuses
+ * read tools, unknown tools and invalid input, as callTool does.
+ */
+export function resolvePipedriveChange(
+  toolName: string,
+  input: GatewayJsonObject = {},
+  options: { pseudonymKey?: string | Uint8Array; redactor?: SecretRedactor } = {},
+): PipedriveChangeResolution {
+  const name = typeof toolName === 'string' ? toolName.trim() : '';
+  const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
+  if (!tool) return { ok: false, reason: 'Unsupported Pipedrive gateway tool.' };
+  if (!tool.change) return { ok: false, reason: `${stripPrefix(tool.name)} is not a write tool.` };
+  const valid = validateCall(tool, input);
+  if (!valid.ok) return { ok: false, reason: `Invalid input for ${stripPrefix(tool.name)}.` };
+  const data = valid.data;
+  const values: Record<string, string | number | boolean> = {};
+  for (const field of tool.change.logFields) {
+    const value = logFieldValue(
+      field.type,
+      field.type === 'fields' ? changedInput(tool.change.record, tool.change.action, data) : data[field.name],
+      options.pseudonymKey,
     );
+    if (value === undefined) continue;
+    // A secret put in a field by mistake never reaches the host's log: with an instance's redactor, a value that
+    // holds a piece of its token is left out.
+    if (options.redactor && leaksSecret(String(value), options.redactor)) continue;
+    values[field.name] = value;
+  }
+  return {
+    ok: true,
+    change: Object.freeze({
+      tool: stripPrefix(tool.name),
+      action: tool.change.action,
+      record: tool.change.record,
+      movesMoney: false as const,
+      requiresConfirmation: tool.requiresConfirmation === true,
+      values: Object.freeze(values),
+    }),
+  };
+}
+
+function admittedToken(options: PipedriveGatewayOptions): string {
+  const value: unknown = (options as Partial<PipedriveGatewayOptions> | undefined)?.apiToken;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new ConfigError('createPipedriveGateway requires options.apiToken. Embedded instances do not read credentials from the environment.');
   }
   // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
   // ours. Checked before anything is built from the key; the refusal is a fixed text that holds no piece of it.
-  if (name === 'apiKey' && !admitsKey(value.trim())) {
+  if (!admitsKey(value.trim())) {
     throw new ConfigError(keyRefusedText(value.trim()));
   }
   return value.trim();
 }
 
+/** The given form of the token, admitted or not, so every error can be masked against it. */
+function givenSecrets(options: PipedriveGatewayOptions): string[] {
+  const value: unknown = (options as Partial<PipedriveGatewayOptions> | undefined)?.apiToken;
+  return typeof value === 'string' && value !== '' ? [value, value.trim()] : [];
+}
+
 /**
- * Create one gateway instance. `apiKey` and `baseUrl` are required and
- * are the only credentials the instance uses; a missing value fails here.
+ * Create one gateway instance for one Pipedrive account. `apiToken` is
+ * required and is the only credential the instance uses; a missing value
+ * fails here.
  */
-export function createExampleGateway(options: ExampleGatewayOptions) {
-  let apiKey: string | undefined;
-  let guard: SecretRedactor | undefined;
-  // What the host gave, admitted or not: every error is masked against it.
-  const given: unknown = (options as Partial<ExampleGatewayOptions> | undefined)?.apiKey;
-  const secrets = typeof given === 'string' ? [given, given.trim()] : [];
+export function createPipedriveGateway(options: PipedriveGatewayOptions) {
+  let firstSecret: string | undefined;
+  // The host's pseudonym key, in every form it could be written, read before anything else can fail.
+  const pseudonymForms = keyForms((options as Partial<PipedriveGatewayOptions> | undefined)?.policy?.pseudonymKey);
+  const guard = new SecretRedactor();
+  // What the host gave, admitted or not: every error is masked against it, the pseudonym key included.
+  const secrets = [...givenSecrets(options), ...pseudonymForms];
+  const refusal = () => keyRefusedText(firstSecret ?? '');
   try {
-    // Admission first, before a redactor is built from the key.
-    apiKey = requiredCredential(options, 'apiKey');
-    guard = new SecretRedactor().addSecret(apiKey);
-    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of the key.
+    // Every secret is known to the guard before any validation that can throw, and inside the try: whatever
+    // happens while registering it leaves as the sealed error below.
+    for (const form of secrets) guard.addSecret(form);
+    // The pseudonym key is admitted like the secrets: as text, printable and sharing no piece with any text
+    // of ours, so no fixed text (a fallback, an error, the tool list) can carry a piece of it; as bytes, every
+    // form of it that is printable text (the bytes read as text, hex, base64) the same way.
+    const pseudonymKey: unknown = (options as Partial<PipedriveGatewayOptions> | undefined)?.policy?.pseudonymKey;
+    const refused =
+      typeof pseudonymKey === 'string'
+        ? !admitsKey(pseudonymKey)
+        : pseudonymForms.some(form => /^[ -~]+$/.test(form) && !admitsKey(form));
+    if (refused) throw new ConfigError(PSEUDONYM_KEY_REFUSED);
+    // Admission of the token, before a redactor is built from it.
+    const apiToken = admittedToken(options);
+    firstSecret = apiToken;
+    guard.addSecret(apiToken);
+    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
     if (leaksSecret(fixedOutputs(), guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(refusal());
     }
-    const gateway = buildGateway(options, apiKey);
+    const gateway = buildGateway(options, apiToken);
     // The tool list leaves the gateway as it is: a key that shares a piece with it is refused.
     if (leaksSecret(gateway.tools, guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(refusal());
     }
     return gateway;
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
-    let message = raw;
-    if (guard && apiKey !== undefined) {
-      // Redacted, then checked whole as the very last step: a message that still holds a piece of the key becomes
-      // the fixed refusal.
-      message = guard.redact(raw);
-      if (leaksSecret(message, guard)) message = keyRefusedText(apiKey);
-    }
+    // Redacted, then checked whole as the very last step: a message that still holds a piece of a key becomes the
+    // fixed refusal.
+    let message = guard.redact(raw);
+    if (leaksSecret(message, guard)) message = refusal();
     // A fresh error in final form (src/key-admission.ts, sealedError): no cause, a stack without frames, and name,
-    // message and stack masked against the key. Then the sink check on the finished object.
+    // message and stack masked against every key. Then the sink check on the finished object.
     const final = sealedError(error instanceof ConfigError ? new ConfigError(message) : new Error(message), ...secrets);
-    if (guard && apiKey !== undefined && leaksSecret(final, guard)) {
-      throw sealedError(new ConfigError(keyRefusedText(apiKey)), ...secrets);
+    if (leaksSecret(final, guard)) {
+      throw sealedError(new ConfigError(refusal()), ...secrets);
     }
     throw final;
   }
 }
 
-function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
-  const baseUrl = requiredCredential(options, 'baseUrl');
-  const { policy: hostPolicy, ...clientOptions } = options;
+const PSEUDONYM_KEY_REFUSED =
+  'policy.pseudonymKey was refused: use at least 32 random printable characters (for example 32 random bytes as hex) or at least 32 random bytes.';
+
+/** A key given as text or bytes, in every form it could be written: as given, or as the bytes read or encoded. */
+function keyForms(key: unknown): string[] {
+  if (typeof key === 'string') return key === '' ? [] : [...new Set([key, key.trim()])];
+  if (key instanceof Uint8Array) {
+    const bytes = Buffer.from(key);
+    return [...new Set(['utf8', 'latin1', 'hex', 'base64', 'base64url'].map(form => bytes.toString(form as BufferEncoding)))];
+  }
+  return [];
+}
+
+/** Register a key given as text or bytes, in every form it could be written. */
+function addKeyMaterial(redactor: SecretRedactor, key: string | Uint8Array): void {
+  for (const form of keyForms(key)) redactor.addSecret(form);
+}
+
+function buildGateway(options: PipedriveGatewayOptions, apiToken: string) {
+  const { policy: hostPolicy, apiToken: _t, ...clientOptions } = options;
   const policy =
-    hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, EXAMPLE_TOOLS.map(tool => tool.name));
+    hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, PIPEDRIVE_TOOLS.map(tool => tool.name));
   if (policy === undefined) {
     // In a scope of its own: a gateway created from inside another instance's call (its audit sink or its fetch)
     // validates against the environment, never against that instance's policy.
     runInCallScope({}, () => validateStartupConfig());
   }
-  const client = new ExampleClient({
-    ...clientOptions,
-    apiKey,
-    baseUrl,
-    credentialEnv: {},
-    // Under a host's policy nothing is read from the environment, this switch included.
-    ...(policy ? { allowCustomBaseUrl: clientOptions.allowCustomBaseUrl ?? false } : {}),
-  });
+  // Only Pipedrive's own address: a base URL other than https://api.pipedrive.com is refused here, so the token cannot
+  // be sent anywhere else, whatever the host passes.
+  const { allowLoopback: _loopback, ...rest } = clientOptions as typeof clientOptions & { allowLoopback?: unknown };
+  if (rest.baseUrl !== undefined && !isPipedriveAddress(rest.baseUrl)) {
+    throw new ConfigError(`createPipedriveGateway accepts only ${DEFAULT_BASE_URL} as baseUrl.`);
+  }
+  const client = new PipedriveClient({ ...rest, apiToken, credentialEnv: {}, allowLoopback: false });
   const redactor: SecretRedactor = client.redactor;
+  // The host's pseudonym key is a secret like the access token: kept out of results, logs and errors.
+  if (policy?.pseudonymKey !== undefined) addKeyMaterial(redactor, policy.pseudonymKey);
   // Every call in a scope of its own, with or without a host policy: a call made from inside another
   // instance's call (its audit sink or its fetch) never runs under that instance's policy, sink or redactor.
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
 
   return {
-    /** Tools enabled on this instance (the policy's or EXAMPLE_DISABLED_TOOLS' disabled tools are left out). */
-    tools: underPolicy(() => exampleGatewayTools.filter(tool => !isToolDisabled(tool.name))),
+    /**
+     * resolvePipedriveChange bound to this instance: a value that holds a piece of
+     * this instance's token is left out of the values.
+     */
+    resolveChange(toolName: string, input: GatewayJsonObject = {}, resolveOptions: { pseudonymKey?: string | Uint8Array } = {}) {
+      return resolvePipedriveChange(toolName, input, { ...resolveOptions, redactor });
+    },
+    /** Tools enabled on this instance (the policy's or PIPEDRIVE_DISABLED_TOOLS' disabled tools are left out). */
+    tools: underPolicy(() => pipedriveGatewayTools.filter(tool => !isToolDisabled(tool.name))),
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted: upstream data can echo the key, and so can an error. Redacted first, as data and depth-limited, and
@@ -282,15 +425,14 @@ function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
       const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
       if (!tool) {
         // Redacted before it is cut short: a cut key would no longer match the redactor.
-        const reason = `Unsupported Example gateway tool: ${redactor.redact(String(toolName)).slice(0, 100)}`;
-        await auditRejectedCall(String(toolName), input, reason, context);
-        return errorResult(redactor.redact(reason));
+        await auditRejectedCall(String(toolName), input, 'unknown_tool', context);
+        return errorResult('Unsupported Pipedrive gateway tool.');
       }
 
       const parsed = tool.inputSchema.safeParse(input ?? {});
       if (!parsed.success) {
         const reason = `Invalid input for ${name}: ${z.prettifyError(parsed.error)}`;
-        await auditRejectedCall(tool.name, input, 'invalid input', context);
+        await auditRejectedCall(tool.name, input, 'invalid_input', context);
         return errorResult(redactor.redact(reason));
       }
 
@@ -303,8 +445,25 @@ function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
   }
 }
 
-/** One gateway instance, as returned by createExampleGateway. */
-export type ExampleGateway = ReturnType<typeof createExampleGateway>;
+/** Whether a base URL is Pipedrive's own address (https://api.pipedrive.com, a trailing slash allowed). */
+function isPipedriveAddress(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      url.hostname.toLowerCase() === 'api.pipedrive.com' &&
+      url.port === '' &&
+      (url.pathname === '/' || url.pathname === '') &&
+      !url.username && !url.password && !value.includes('?') && !value.includes('#')
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** One gateway instance, as returned by createPipedriveGateway. */
+export type PipedriveGateway = ReturnType<typeof createPipedriveGateway>;
 
 /** The data as it came; callTool redacts it and only then copies it as JSON. */
 function jsonResult(text: string, structuredContent: unknown): GatewayToolResult {

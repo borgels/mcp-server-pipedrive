@@ -5,8 +5,8 @@
 // it where a number or a switch was expected.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FRAGMENT_LENGTH, MAX_REDACT_DEPTH, redactDeep, SecretRedactor } from '../src/errors.js';
-import { createExampleGateway, type GatewayToolResult } from '../src/gateway.js';
-import { BASE, gateway } from './helpers.js';
+import { createPipedriveGateway, type GatewayToolResult } from '../src/gateway.js';
+import { BASE, gateway, ORG_CREATED, record, testGateway } from './helpers.js';
 
 const KEY = `tenant"a\\kEy-${'Q7'.repeat(10)}-ZZtop-0123456789`;
 const FRAGMENT = KEY.slice(0, 12);
@@ -14,7 +14,7 @@ const originalEnv = { ...process.env };
 
 beforeEach(() => {
   for (const name of Object.keys(process.env)) {
-    if (name.startsWith('EXAMPLE_')) delete process.env[name];
+    if (name.startsWith('PIPEDRIVE_')) delete process.env[name];
   }
 });
 
@@ -53,40 +53,37 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
 const upstream: typeof fetch = async (input, init) => {
   const url = String(input).split('?')[0] ?? '';
   const path = url.slice(BASE.length);
-  if (init?.method === 'POST') return json({ id: 'new', echo: KEY, [KEY]: FRAGMENT }, 201);
+  if (init?.method === 'POST') return json({ ...ORG_CREATED, comment: `echo ${KEY} ${FRAGMENT}` });
   switch (path) {
-    case '/items/echo':
-      return json({ name: KEY, fragment: FRAGMENT, [KEY]: 1, [`k ${FRAGMENT}`]: { deeper: [FRAGMENT, KEY] } });
-    case '/items/error':
+    case `/api/v2/deals/1`:
+      return json({
+        ...record('1', { title: `${KEY} ${FRAGMENT}`, lost_reason: `k ${FRAGMENT} ${KEY}`, status: 'open' }),
+        associations: { contacts: { results: [{ id: '5' }] }, [KEY]: { results: [{ id: '6' }] } },
+      });
+    case `/api/v2/organizations/2`:
+      return json(record('2', { name: KEY }));
+    case `/api/v2/deals/2`:
       return json({ message: `Rejected ${KEY}`, code: FRAGMENT, details: { [KEY]: FRAGMENT } }, 400);
-    case '/items/unauthorised':
+    case `/api/v2/deals/3`:
       return json({ code: FRAGMENT, error: FRAGMENT }, 401);
-    case '/items/big-error':
+    case `/api/v2/deals/4`:
       return new Response(`${' '.repeat(70_000)}${KEY}`, { status: 500, headers: { 'content-type': 'text/plain' } });
-    case '/items/big':
+    case `/api/v2/deals/5`:
       return new Response(`"${' '.repeat(2_000)}${KEY}"`, { status: 200, headers: { 'content-type': 'application/json' } });
-    case '/items/redirect':
+    case `/api/v2/deals/6`:
       return new Response(null, { status: 302, headers: { location: `https://elsewhere.test/${FRAGMENT}?k=${KEY}` } });
-    case '/items/network':
+    case `/api/v2/deals/7`:
       throw new TypeError(`fetch failed for ${KEY}`, { cause: Object.assign(new Error(`connect ${FRAGMENT}`), { code: FRAGMENT }) });
-    case '/items/combined':
-      return json({ name: 'ok' });
-    case '/items/combined/history':
-      return json({ message: `history rejected ${FRAGMENT}`, code: FRAGMENT }, 401);
-    case '/items/combined-redirect':
-      return json({ name: 'ok' });
-    case '/items/combined-redirect/history':
-      return new Response(null, { status: 307, headers: { location: `/${FRAGMENT}` } });
     default:
       return json({ message: `no stub ${KEY}` }, 404);
   }
 };
 
 describe('no piece of the key leaves an instance', () => {
-  it('holds for every channel: results, errors, nested failures and audit records', async () => {
+  it('holds for every channel: results, errors and audit records', async () => {
     const records: unknown[] = [];
-    const gw = createExampleGateway({
-      apiKey: KEY,
+    const gw = testGateway({
+      apiToken: KEY,
       baseUrl: BASE,
       fetchImpl: upstream,
       maxAttempts: 1,
@@ -94,17 +91,13 @@ describe('no piece of the key leaves an instance', () => {
       policy: { enableWrites: true, audit: record => void records.push(record) },
     });
     const results: GatewayToolResult[] = [];
-    for (const itemId of ['echo', 'error', 'unauthorised', 'big-error', 'big', 'redirect', 'network', 'missing']) {
-      results.push(await gw.callTool('get_item', { itemId }, { caller: `caller ${KEY}`, requestId: FRAGMENT }));
+    for (const dealId of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      results.push(await gw.callTool('get_deal', { dealId }, { caller: `caller ${KEY}`, requestId: FRAGMENT }));
     }
-    const combined = await gw.callTool('get_item', { itemId: 'combined', includeHistory: true });
-    const redirected = await gw.callTool('get_item', { itemId: 'combined-redirect', includeHistory: true });
-    results.push(combined, redirected, await gw.callTool('create_item', { name: KEY }));
-    results.push(await gw.callTool(`get_item ${KEY}`, {}), await gw.callTool('get_item', { itemId: 'x', [KEY]: FRAGMENT }));
+    results.push(await gw.callTool('create_organization', { name: KEY }));
+    results.push(await gw.callTool(`get_item ${KEY}`, {}), await gw.callTool('get_deal', { dealId: 11, [KEY]: FRAGMENT }));
 
     expect(results[0]?.isError).toBeUndefined();
-    expect(combined.structuredContent).toMatchObject({ history: { error: 'Example API request failed with HTTP 401' } });
-    expect(redirected.structuredContent).toMatchObject({ history: { error: 'Example API request failed.' } });
     expect(records.length).toBeGreaterThan(10);
     expect(leaks(results)).toEqual([]);
     expect(leaks(records)).toEqual([]);
@@ -112,12 +105,12 @@ describe('no piece of the key leaves an instance', () => {
 
   it('holds for errors about the environment, with or without an instance', async () => {
     const answers: unknown[] = [];
-    for (const name of ['EXAMPLE_ENABLE_WRITES', 'EXAMPLE_DISABLED_TOOLS', 'EXAMPLE_TIMEOUT_MS', 'EXAMPLE_MAX_CONCURRENCY', 'EXAMPLE_MAX_RESPONSE_BYTES']) {
+    for (const name of ['PIPEDRIVE_ENABLE_WRITES', 'PIPEDRIVE_DISABLED_TOOLS', 'PIPEDRIVE_TIMEOUT_MS', 'PIPEDRIVE_MAX_CONCURRENCY', 'PIPEDRIVE_MAX_RESPONSE_BYTES']) {
       process.env[name] = KEY;
       try {
         // Without a host policy the environment applies: the bad value fails at creation or at the call.
-        const gw = createExampleGateway({ apiKey: KEY, baseUrl: BASE, fetchImpl: upstream });
-        answers.push(await gw.callTool('create_item', { name: 'x' }));
+        const gw = testGateway({ apiToken: KEY, baseUrl: BASE, fetchImpl: upstream });
+        answers.push(await gw.callTool('create_organization', { name: 'x' }));
       } catch (error) {
         answers.push((error as Error).message);
       }
@@ -142,8 +135,8 @@ describe('redactDeep', () => {
 
 describe('the data in the text block', () => {
   it('carries the redacted structured content as compact JSON after the summary', async () => {
-    const gw = createExampleGateway({ apiKey: KEY, baseUrl: BASE, fetchImpl: upstream, maxAttempts: 1 });
-    const result = await gw.callTool('get_item', { itemId: 'echo' });
+    const gw = testGateway({ apiToken: KEY, baseUrl: BASE, fetchImpl: upstream, maxAttempts: 1 });
+    const result = await gw.callTool('get_deal', { dealId: 1 });
     expect(result.isError).toBeUndefined();
     expect(result.content).toHaveLength(1);
     const [summary, data, ...rest] = result.content[0]!.text.split('\n\n');
@@ -157,16 +150,16 @@ describe('the data in the text block', () => {
   });
 
   it('gives a client that reads only the text the data', async () => {
-    const { gw } = gateway({ [`GET ${BASE}/items/7`]: { body: { id: '7', name: 'Testvare Blå' } } });
-    const result = await gw.callTool('get_item', { itemId: '7' });
+    const { gw } = gateway({ [`GET ${BASE}/api/v2/deals/7`]: { body: record('7', { title: 'Fornyelse Blå' }) } });
+    const result = await gw.callTool('get_deal', { dealId: 7 });
     expect(result.isError, result.content[0]?.text).toBeUndefined();
-    expect(result.content[0]!.text).toContain('"name":"Testvare Blå"');
+    expect(result.content[0]!.text).toContain('"title":"Fornyelse Blå"');
     expect(result.content[0]!.text.endsWith(JSON.stringify(result.structuredContent))).toBe(true);
   });
 
   it('leaves error results with their text only', async () => {
-    const gw = createExampleGateway({ apiKey: KEY, baseUrl: BASE, fetchImpl: upstream, maxAttempts: 1 });
-    const result = await gw.callTool('get_item', { itemId: 'error' });
+    const gw = testGateway({ apiToken: KEY, baseUrl: BASE, fetchImpl: upstream, maxAttempts: 1 });
+    const result = await gw.callTool('get_deal', { dealId: 2 });
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toBeUndefined();
     expect(result.content[0]!.text).not.toContain('\n\n{');

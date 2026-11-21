@@ -1,48 +1,42 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.borgels/mcp-server-example",
-  "title": "Example",
-  "description": "Unofficial MCP server for the Example API.",
+  "name": "io.github.borgels/mcp-server-pipedrive",
+  "title": "Pipedrive",
+  "description": "Unofficial MCP server for Pipedrive CRM: deals, persons, organizations, activities and notes.",
   "repository": {
-    "url": "https://github.com/borgels/mcp-server-example",
+    "url": "https://github.com/borgels/mcp-server-pipedrive",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.1.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "mcp-server-example",
-      "version": "0.1.1",
+      "identifier": "mcp-server-pipedrive",
+      "version": "0.1.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
-          "name": "EXAMPLE_API_KEY",
-          "description": "API key for the Example API.",
+          "name": "PIPEDRIVE_API_TOKEN",
+          "description": "The personal API token of a Pipedrive user (Personal preferences > API).",
           "isRequired": true,
           "isSecret": true
         },
         {
-          "name": "EXAMPLE_BASE_URL",
-          "description": "Base URL of the Example API.",
-          "isRequired": true,
-          "placeholder": "https://api.vendor.test/v1"
-        },
-        {
-          "name": "EXAMPLE_ENABLE_WRITES",
-          "description": "Enable the write tools.",
+          "name": "PIPEDRIVE_ENABLE_WRITES",
+          "description": "Enable the write tools (create and change deals, persons, organizations, activities and notes; move deals).",
           "format": "boolean",
           "default": "false"
         },
         {
-          "name": "EXAMPLE_DISABLED_TOOLS",
+          "name": "PIPEDRIVE_DISABLED_TOOLS",
           "description": "Comma-separated tool names to disable."
         },
         {
-          "name": "EXAMPLE_AUDIT_LOG",
+          "name": "PIPEDRIVE_AUDIT_LOG",
           "description": "Path of the JSONL audit log. Write tools refuse to run if it cannot be written.",
           "format": "filepath"
         }
