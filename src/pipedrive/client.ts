@@ -406,6 +406,9 @@ export class PipedriveClient implements UpstreamClient {
     for (let attempt = 1; ; attempt += 1) {
       const token = await this.requestAccessToken(init);
       if (admitsKey(token)) return this.keepAccessToken(token);
+      // Never used, so it is never sent to the API, and no answer can hold it; it is taken back at Pipedrive all the
+      // same (only this access token: the refresh token stays), and nothing waits for that.
+      this.revokeAccessToken(token);
       if (attempt >= ACCESS_TOKEN_ATTEMPTS) {
         throw new Error('Pipedrive handed out an access token this server cannot keep apart from its own texts. Nothing was sent; try again.');
       }
@@ -442,9 +445,6 @@ export class PipedriveClient implements UpstreamClient {
       typeof value.expires_in === 'number' && Number.isInteger(value.expires_in) && value.expires_in > 0 && value.expires_in <= 86_400
         ? value.expires_in
         : 3_600;
-    // Every access token this client was given stays a secret of the instance for as long as it lives, also one that
-    // was not used or has expired: expiry does not make it fit to show.
-    this.redactor.addSecret(token);
     const rotated = value.refresh_token;
     if (typeof rotated === 'string' && TOKEN_TEXT.test(rotated) && rotated !== this.refreshToken) {
       this.redactor.addSecret(refreshTokenSecret(rotated));
@@ -459,10 +459,35 @@ export class PipedriveClient implements UpstreamClient {
     return token;
   }
 
-  /** Use an admitted access token from now on, for the lifetime the answer gave. */
+  /**
+   * Use an admitted access token from now on, for the lifetime the answer gave. Every access token this client uses
+   * stays a secret of the instance for as long as it lives, also once it has expired: expiry does not make it fit to
+   * show.
+   */
   private keepAccessToken(token: string): string {
+    this.redactor.addSecret(token);
     this.access = { token, expiresAt: this.now() + this.expiresIn * 1000 };
     return token;
+  }
+
+  /** Take back one unused access token at Pipedrive (RFC 7009, as documented); best effort, its answer is not read. */
+  private revokeAccessToken(token: string): void {
+    const oauth = this.oauth as { basic: string };
+    const url = this.tokenUrl.replace(/\/oauth\/token$/, '/oauth/revoke');
+    void this.fetchImpl(url, {
+      method: 'POST',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(this.timeoutMs),
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        [AUTHORIZATION_HEADER]: `Basic ${oauth.basic}`,
+      },
+      body: new URLSearchParams({ token, token_type_hint: 'access_token' }).toString(),
+    })
+      .then(response => discardBody(response))
+      .catch(() => undefined);
   }
 
   /** One request with the given credential header. */

@@ -201,11 +201,49 @@ describe('OAuth access: more cases', () => {
     const p = pipedrive({ tokens: ['v1u:content-1111-qqqq-q', 'v1u:content-2222-qqqq-q', 'v1u:content-3333-qqqq-q'] });
     const c = client(p.fetchImpl);
     await expect(c.get('/api/v2/deals')).rejects.toThrow(/cannot keep apart/);
-    expect(p.calls.every(call => call.url === TOKEN_URL)).toBe(true);
+    expect(p.calls.every(call => call.url === TOKEN_URL || call.url === 'https://oauth.pipedrive.com/oauth/revoke')).toBe(true);
+    expect(p.calls.filter(call => call.url.endsWith('/oauth/revoke'))).toHaveLength(3);
   });
 });
 
 describe('OAuth access in the gateway', () => {
+  const access = { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, refreshToken: REFRESH, apiDomain: DOMAIN };
+
+  for (const refused of ['v1u:content-1111-qqqq-q', 'v1u:redact-answer-qqqq-q']) {
+    it(`an access token that shares a piece with its own texts (${refused.slice(4, 10)}) is not used, and the answer keeps its form`, async () => {
+      const p = pipedrive({ tokens: [refused, ACCESS_1], api: () => json({ success: true, data: { id: 7002, name: 'Sælger Demo', company_id: 7001 } }) });
+      const records: unknown[] = [];
+      const gateway = createPipedriveGateway({ oauth: access, fetchImpl: p.fetchImpl, policy: { audit: record => void records.push(record) } });
+      const result = await gateway.callTool('check_connection', {}, { caller: 'demo-caller' } as never);
+      expect(result.isError).toBeFalsy();
+      expect(Array.isArray(result.content)).toBe(true);
+      expect(result.content[0]?.type).toBe('text');
+      expect(result.structuredContent).toBeDefined();
+      expect(JSON.stringify(result.structuredContent)).toContain('7002');
+      // Taken back at Pipedrive, and never sent to the API.
+      expect(p.calls.some(call => call.url === 'https://oauth.pipedrive.com/oauth/revoke' && String(call.init?.body).includes('token_type_hint=access_token'))).toBe(true);
+      for (const call of p.calls.filter(c => c.url.startsWith(DOMAIN))) {
+        expect((call.init?.headers as Record<string, string>).Authorization).toBe(`Bearer ${ACCESS_1}`);
+      }
+      expect(JSON.stringify(records)).not.toMatch(/aaaa-cccc|rrrr-ffff|cccc-ssss/);
+    });
+  }
+
+  it('keeps earlier access tokens out of answers and audit records', async () => {
+    const tokens = ['v1u:aaaa-1111-aaaa-1111-x', 'v1u:bbbb-2222-bbbb-2222-y']; // gitleaks:allow
+    let call = 0;
+    const p = pipedrive({
+      tokens: [...tokens],
+      // The first access token is refused once, so the instance holds two; Pipedrive then echoes the first.
+      api: () => (call++ === 0 ? json({ success: false }, 401) : json({ success: true, data: { id: 7002, name: `echo ${tokens[0]}`, company_id: 7001 } })),
+    });
+    const records: unknown[] = [];
+    const gateway = createPipedriveGateway({ oauth: access, fetchImpl: p.fetchImpl, policy: { audit: record => void records.push(record) } });
+    const result = await gateway.callTool('check_connection', {});
+    expect(JSON.stringify(result)).not.toMatch(/aaaa-1111|bbbb-2222/);
+    expect(JSON.stringify(records)).not.toMatch(/aaaa-1111|bbbb-2222/);
+  });
+
   it('redacts the secrets when Pipedrive echoes them in an answer', async () => {
     const p = pipedrive({
       api: () => json({ success: true, data: { id: 7002, name: `echo ${ACCESS_1} ${REFRESH} ${CLIENT_SECRET}`, company_id: 7001 } }),
