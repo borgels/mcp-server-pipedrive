@@ -256,7 +256,7 @@ export const PIPEDRIVE_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'pipedrive_check_connection',
     title: 'Check Pipedrive connection',
-    description: 'Check that the API token works: the user id it belongs to, the company, its default currency and time zone.',
+    description: 'Check that the access works: the user id it belongs to, the company, its default currency and time zone.',
     inputShape: {},
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,

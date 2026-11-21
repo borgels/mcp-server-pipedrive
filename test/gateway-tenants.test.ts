@@ -60,7 +60,7 @@ describe('explicit gateway credentials', () => {
       }
       expect(caught, JSON.stringify(options)).toBeInstanceOf(ConfigError);
       expect(caught!.message).toBe(
-        'createPipedriveGateway requires options.apiToken. Embedded instances do not read credentials from the environment.',
+        'createPipedriveGateway requires options.apiToken or options.oauth. Embedded instances do not read credentials from the environment.',
       );
     }
   });
