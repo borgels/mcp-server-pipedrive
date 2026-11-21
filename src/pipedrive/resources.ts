@@ -100,12 +100,25 @@ const person = z.object({
   is_deleted: opt(z.boolean()),
 });
 
-const address = z.object({
-  value: opt(text(2000)),
-  postal_code: opt(text(100)),
-  locality: opt(text(500)),
-  country: opt(text(500)),
-});
+/** Every documented field of an organization's address (API v2 `address`). */
+export const ADDRESS_FIELDS = [
+  'value',
+  'street_number',
+  'route',
+  'subpremise',
+  'sublocality',
+  'locality',
+  'admin_area_level_1',
+  'admin_area_level_2',
+  'country',
+  'postal_code',
+  'formatted_address',
+] as const;
+
+const address = z.object(Object.fromEntries(ADDRESS_FIELDS.map(field => [field, opt(text(2000))])) as Record<
+  (typeof ADDRESS_FIELDS)[number],
+  z.ZodOptional<z.ZodNullable<z.ZodString>>
+>);
 
 const organization = z.object({
   id,
@@ -343,12 +356,7 @@ export function shape(type: RecordType, row: Json): Json {
         ['id', r.id],
         ['name', r.name],
         ['owner_id', r.owner_id],
-        ['address', r.address ? compact([
-          ['value', r.address.value],
-          ['postal_code', r.address.postal_code],
-          ['locality', r.address.locality],
-          ['country', r.address.country],
-        ]) : r.address],
+        ['address', r.address ? compact(ADDRESS_FIELDS.map(field => [field, r.address?.[field] ?? undefined])) : r.address],
         ['add_time', r.add_time],
         ['update_time', r.update_time],
         ['label_ids', r.label_ids],

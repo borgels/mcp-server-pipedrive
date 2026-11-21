@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-pipedrive",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mcpName": "io.github.borgels/mcp-server-pipedrive",
   "description": "Unofficial MCP server for Pipedrive CRM: deals, persons, organizations, activities, notes and pipelines.",
   "type": "module",

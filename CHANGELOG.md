@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- An organization's address is read with every documented field (street,
+  number, floor, area, region, postal code, country and the formatted
+  address), so a change answers with the whole old address.
+- A test shows that the pipeline list follows its own cursor.
+
 ## 0.1.0
 
 First version for Pipedrive CRM, from the MCP server template (0.1.1), with
