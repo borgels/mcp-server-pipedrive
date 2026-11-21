@@ -259,6 +259,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "Pipedrive answered the token request without an access token. Nothing in the answer was used.",
   "Pipedrive answered without the expected data. Nothing in the answer was used.",
   "Pipedrive did not accept the access. The API token may have been changed, the app removed or the user deactivated; the user connects again.",
+  "Pipedrive handed out an access token this server cannot keep apart from its own texts. Nothing was sent; try again.",
   "Pipedrive is throttling requests (the limit per two seconds, or the daily budget of the company). Wait and retry later.",
   "Pipedrive refused access: the user whose token this is may not see or change this, or the company does not let the user use the API. Retrying will not help.",
   "Pipedrive refused the change (for example a field it does not accept here). Nothing was changed.",

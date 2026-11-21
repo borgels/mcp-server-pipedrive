@@ -1,6 +1,7 @@
 import { ConfigError, readEnvInteger, readEnvString, type Env } from '../config-env.js';
 import { PipedriveHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
 import { USER_AGENT } from '../version.js';
+import { admitsKey } from '../key-admission.js';
 
 /**
  * How the client is let in. Pipedrive documents two ways
@@ -120,6 +121,8 @@ export function refreshTokenSecret(token: string): string {
   return match ? (match[1] as string) : token;
 }
 
+/** How often a renewal is asked for an access token that can be kept apart from the server's own texts. */
+const ACCESS_TOKEN_ATTEMPTS = 3;
 /** An access token is renewed this long before it expires. */
 const TOKEN_EARLY_RENEWAL_MS = 60_000;
 /** What a token from Pipedrive may consist of: printable ASCII, within a sane length. */
@@ -257,7 +260,7 @@ export class PipedriveClient implements UpstreamClient {
   private readonly now: () => number;
   private access?: { token: string; expiresAt: number };
   private pendingToken?: Promise<string>;
-  private readonly retired: string[] = [];
+  private expiresIn = 3_600;
   readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
@@ -397,6 +400,20 @@ export class PipedriveClient implements UpstreamClient {
       },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: this.refreshToken as string }).toString(),
     };
+    // An access token that shares a piece with one of this server's own texts could not be kept apart from them in an
+    // answer (the sink check would withhold the answer, or a fallback). Such a token is not used: the renewal is asked
+    // once more, and Pipedrive hands out a new access token each time.
+    for (let attempt = 1; ; attempt += 1) {
+      const token = await this.requestAccessToken(init);
+      if (admitsKey(token)) return this.keepAccessToken(token);
+      if (attempt >= ACCESS_TOKEN_ATTEMPTS) {
+        throw new Error('Pipedrive handed out an access token this server cannot keep apart from its own texts. Nothing was sent; try again.');
+      }
+    }
+  }
+
+  /** One refresh grant; the access token from the answer, checked for form only. Rotation is handled here too. */
+  private async requestAccessToken(init: RequestInit): Promise<string> {
     const answer = await this.execute(false, 'POST', this.tokenUrl, init, async response => {
       if (isRedirect(response.status)) {
         await discardBody(response);
@@ -421,19 +438,13 @@ export class PipedriveClient implements UpstreamClient {
     if (value.token_type !== undefined && (typeof value.token_type !== 'string' || value.token_type.toLowerCase() !== 'bearer')) {
       throw new Error('Pipedrive answered the token request with another token type than Bearer. Nothing in the answer was used.');
     }
-    const expiresIn =
+    this.expiresIn =
       typeof value.expires_in === 'number' && Number.isInteger(value.expires_in) && value.expires_in > 0 && value.expires_in <= 86_400
         ? value.expires_in
         : 3_600;
-    // Earlier access tokens stay redacted for two renewals (one may still be valid, and errors in flight may hold it);
-    // older ones have expired and are let go.
-    const previous = this.access?.token;
+    // Every access token this client was given stays a secret of the instance for as long as it lives, also one that
+    // was not used or has expired: expiry does not make it fit to show.
     this.redactor.addSecret(token);
-    if (previous && previous !== token) {
-      this.retired.push(previous);
-      while (this.retired.length > 2) this.redactor.removeSecret(this.retired.shift() as string);
-    }
-    this.access = { token, expiresAt: this.now() + expiresIn * 1000 };
     const rotated = value.refresh_token;
     if (typeof rotated === 'string' && TOKEN_TEXT.test(rotated) && rotated !== this.refreshToken) {
       this.redactor.addSecret(refreshTokenSecret(rotated));
@@ -445,6 +456,12 @@ export class PipedriveClient implements UpstreamClient {
         // A host's callback failing does not fail the call; the token is in use in memory.
       }
     }
+    return token;
+  }
+
+  /** Use an admitted access token from now on, for the lifetime the answer gave. */
+  private keepAccessToken(token: string): string {
+    this.access = { token, expiresAt: this.now() + this.expiresIn * 1000 };
     return token;
   }
 

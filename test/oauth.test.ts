@@ -141,7 +141,84 @@ describe('OAuth access in the client', () => {
   });
 });
 
+describe('OAuth access: more cases', () => {
+  it('asks the token endpoint once for calls made at the same time', async () => {
+    const p = pipedrive({});
+    const c = client(p.fetchImpl);
+    await Promise.all([c.get('/api/v2/deals'), c.get('/api/v2/persons'), c.get('/api/v2/activities')]);
+    expect(p.calls.filter(call => call.url === TOKEN_URL)).toHaveLength(1);
+  });
+
+  it('gives up with the 401 when the renewed access is not taken either', async () => {
+    const p = pipedrive({ api: () => json({ success: false }, 401) });
+    const c = client(p.fetchImpl);
+    await expect(c.get('/api/v2/deals')).rejects.toMatchObject({ status: 401 });
+    expect(p.calls.filter(call => call.url === TOKEN_URL)).toHaveLength(2);
+    expect(p.calls.filter(call => call.url !== TOKEN_URL)).toHaveLength(2);
+  });
+
+  it('renews and sends a change again after a 401, since nothing was done', async () => {
+    const p = pipedrive({
+      api: (_url, auth) => (auth === `Bearer ${ACCESS_1}` ? json({ success: false }, 401) : json({ success: true, data: { id: 5 } })),
+    });
+    const c = client(p.fetchImpl);
+    await expect(c.patch('/api/v2/deals/5', { title: 'Ny' })).resolves.toEqual({ success: true, data: { id: 5 } });
+    const writes = p.calls.filter(call => call.url === `${DOMAIN}/api/v2/deals/5`);
+    expect(writes).toHaveLength(2);
+    expect(writes.map(w => w.init?.method)).toEqual(['PATCH', 'PATCH']);
+  });
+
+  it('follows no redirect from the token endpoint or the company address', async () => {
+    const fromToken = vi.fn(async () => new Response(null, { status: 302, headers: { location: 'https://evil.test/' } }));
+    await expect(client(fromToken as unknown as typeof fetch).get('/api/v2/deals')).rejects.toThrow(/redirect/);
+    expect(fromToken).toHaveBeenCalledTimes(1);
+    const p = pipedrive({ api: () => new Response(null, { status: 301, headers: { location: 'https://evil.test/' } }) });
+    await expect(client(p.fetchImpl).get('/api/v2/deals')).rejects.toThrow(/redirect/);
+    expect(p.calls.every(call => call.url === TOKEN_URL || call.url.startsWith(DOMAIN))).toBe(true);
+  });
+
+  it('keeps every access token it was given a secret for as long as it lives', async () => {
+    let now = 0;
+    const tokens = ['v1u:aaaa-1111-aaaa-1111-x', 'v1u:bbbb-2222-bbbb-2222-y', 'v1u:cccc-3333-cccc-3333-z', 'v1u:dddd-4444-dddd-4444-w']; // gitleaks:allow
+    const p = pipedrive({ tokens: [...tokens] });
+    const c = client(p.fetchImpl, { now: () => now });
+    for (let i = 0; i < 4; i += 1) {
+      await c.get('/api/v2/deals');
+      now += 3_600_000;
+    }
+    for (const token of tokens) expect(c.redactor.redact(`caller ${token}`)).not.toContain(token.slice(4, 14));
+  });
+
+  it('does not use an access token that shares a piece with its own texts, and asks again', async () => {
+    const p = pipedrive({ tokens: ['v1u:content-answer-redact-q', ACCESS_1] });
+    const c = client(p.fetchImpl);
+    await c.get('/api/v2/deals');
+    expect(p.calls.filter(call => call.url === TOKEN_URL)).toHaveLength(2);
+    expect((p.calls.at(-1)?.init?.headers as Record<string, string>).Authorization).toBe(`Bearer ${ACCESS_1}`);
+  });
+
+  it('gives up after three such tokens without sending anything to the API', async () => {
+    const p = pipedrive({ tokens: ['v1u:content-1111-qqqq-q', 'v1u:content-2222-qqqq-q', 'v1u:content-3333-qqqq-q'] });
+    const c = client(p.fetchImpl);
+    await expect(c.get('/api/v2/deals')).rejects.toThrow(/cannot keep apart/);
+    expect(p.calls.every(call => call.url === TOKEN_URL)).toBe(true);
+  });
+});
+
 describe('OAuth access in the gateway', () => {
+  it('redacts the secrets when Pipedrive echoes them in an answer', async () => {
+    const p = pipedrive({
+      api: () => json({ success: true, data: { id: 7002, name: `echo ${ACCESS_1} ${REFRESH} ${CLIENT_SECRET}`, company_id: 7001 } }),
+    });
+    const gateway = createPipedriveGateway({
+      oauth: { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, refreshToken: REFRESH, apiDomain: DOMAIN },
+      fetchImpl: p.fetchImpl,
+    });
+    const result = await gateway.callTool('check_connection', {});
+    const text = JSON.stringify(result);
+    expect(text).not.toMatch(/aaaa-cccc|rrrr-ffff|cccc-ssss/);
+  });
+
   const oauth = { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, refreshToken: REFRESH, apiDomain: DOMAIN };
 
   it('calls the user’s company address, and an owner id that is also in the refresh token comes through', async () => {
