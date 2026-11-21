@@ -47,7 +47,7 @@ describe.skipIf(!token)('live Pipedrive test company', () => {
 
     const person = await run('create_person', { name: label, email: 'systemtest@example.com', orgId });
     const personId = id(person.id);
-    expect((await run('update_person', { personId, jobTitle: 'Testperson' })).updated).toBe(true);
+    expect((await run('update_person', { personId, name: `${label}, rettet` })).updated).toBe(true);
 
     const deal = await run('create_deal', { title: label, value: 1, currency: 'DKK', personId, orgId });
     const dealId = id(deal.id);

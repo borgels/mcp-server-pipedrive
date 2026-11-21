@@ -17,7 +17,6 @@ export const BASE = 'https://api.pipedrive.com';
 type TestOptions = Omit<Partial<PipedriveGatewayOptions>, 'fetchImpl'> & {
   apiToken?: string;
   baseUrl?: string;
-  allowCustomBaseUrl?: boolean;
   fetchImpl?: unknown;
   credentialEnv?: Record<string, string | undefined>;
 };

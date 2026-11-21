@@ -516,7 +516,7 @@ export const PIPEDRIVE_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'pipedrive_update_person',
     title: 'Update person (Pipedrive)',
-    description: `Change fields of a person; fields not given stay as they are (null clears a field). The answer holds the fields as they were, so the change can be undone. ${WRITE_NOTE}`,
+    description: `Change fields of a person; fields not given stay as they are (null clears a field). A new e-mail or phone replaces all the person's e-mail addresses or phone numbers with that one. The answer holds the fields as they were, every address and number included, so they can be restored. ${WRITE_NOTE}`,
     inputShape: {
       personId: idSchema('The person (from search_persons).'),
       name: z.string().trim().min(1).max(255).optional().describe('New name.'),

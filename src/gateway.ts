@@ -1,6 +1,6 @@
 import { z } from 'zod/v4';
 import { UNTRUSTED_CONTENT_NOTE } from './pipedrive/annotations.js';
-import { PipedriveClient, type PipedriveClientOptions } from './pipedrive/client.js';
+import { DEFAULT_BASE_URL, PipedriveClient, type PipedriveClientOptions } from './pipedrive/client.js';
 import {
   isToolDisabled,
   resolveInstancePolicy,
@@ -43,7 +43,7 @@ import {
  *
  * Instance policy (writes, disabled tools, audit) comes from the host when it
  * passes `policy`: that instance then reads none of PIPEDRIVE_ENABLE_WRITES,
- * PIPEDRIVE_DISABLED_TOOLS, PIPEDRIVE_AUDIT_LOG or PIPEDRIVE_ALLOW_CUSTOM_BASE_URL,
+ * PIPEDRIVE_DISABLED_TOOLS or PIPEDRIVE_AUDIT_LOG,
  * so two tenants in one process can have different settings. Without
  * `policy` the instance uses the environment, as the MCP server does. Limits
  * (timeouts, retries) are still read from the environment and apply to every
@@ -131,7 +131,7 @@ export interface GatewayToolCatalogEntry {
   readonly change?: PipedriveChangeSpec;
 }
 
-export interface PipedriveGatewayOptions extends Omit<PipedriveClientOptions, 'apiToken' | 'credentialEnv'> {
+export interface PipedriveGatewayOptions extends Omit<PipedriveClientOptions, 'apiToken' | 'credentialEnv' | 'allowLoopback'> {
   /** The personal API token of a Pipedrive user. Required; a secret; never read from the environment. */
   apiToken: string;
   /**
@@ -371,13 +371,13 @@ function buildGateway(options: PipedriveGatewayOptions, apiToken: string) {
     // validates against the environment, never against that instance's policy.
     runInCallScope({}, () => validateStartupConfig());
   }
-  const client = new PipedriveClient({
-    ...clientOptions,
-    apiToken,
-    credentialEnv: {},
-    // Under a host's policy nothing is read from the environment, this switch included.
-    ...(policy ? { allowCustomBaseUrl: clientOptions.allowCustomBaseUrl ?? false } : {}),
-  });
+  // Only Pipedrive's own address: a base URL other than https://api.pipedrive.com is refused here, so the token cannot
+  // be sent anywhere else, whatever the host passes.
+  const { allowLoopback: _loopback, ...rest } = clientOptions as typeof clientOptions & { allowLoopback?: unknown };
+  if (rest.baseUrl !== undefined && !isPipedriveAddress(rest.baseUrl)) {
+    throw new ConfigError(`createPipedriveGateway accepts only ${DEFAULT_BASE_URL} as baseUrl.`);
+  }
+  const client = new PipedriveClient({ ...rest, apiToken, credentialEnv: {}, allowLoopback: false });
   const redactor: SecretRedactor = client.redactor;
   // The host's pseudonym key is a secret like the access token: kept out of results, logs and errors.
   if (policy?.pseudonymKey !== undefined) addKeyMaterial(redactor, policy.pseudonymKey);
@@ -442,6 +442,23 @@ function buildGateway(options: PipedriveGatewayOptions, apiToken: string) {
     } catch (error) {
       return errorResult(formatUnknownError(error, redactor));
     }
+  }
+}
+
+/** Whether a base URL is Pipedrive's own address (https://api.pipedrive.com, a trailing slash allowed). */
+function isPipedriveAddress(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      url.hostname.toLowerCase() === 'api.pipedrive.com' &&
+      url.port === '' &&
+      (url.pathname === '/' || url.pathname === '') &&
+      !url.username && !url.password && !value.includes('?') && !value.includes('#')
+    );
+  } catch {
+    return false;
   }
 }
 

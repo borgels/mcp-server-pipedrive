@@ -1,4 +1,4 @@
-import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
+import { ConfigError, readEnvInteger, readEnvString, type Env } from '../config-env.js';
 import { PipedriveHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
 import { USER_AGENT } from '../version.js';
 
@@ -38,8 +38,12 @@ export interface PipedriveClientOptions {
    * the response is returned to the caller instead.
    */
   retryBudgetMs?: number;
-  /** Allow hosts other than Pipedrive's API host (env PIPEDRIVE_ALLOW_CUSTOM_BASE_URL=true). Loopback http is always allowed for mocks. */
-  allowCustomBaseUrl?: boolean;
+  /**
+   * Allow a loopback address (http or https on localhost, 127.0.0.1 or ::1), for local mocks in tests only. There is
+   * no environment variable for it, and the gateway never sets it: no other host than api.pipedrive.com can be
+   * configured, so the token cannot be sent anywhere else.
+   */
+  allowLoopback?: boolean;
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -177,9 +181,8 @@ export class PipedriveClient implements UpstreamClient {
     const credentialEnv = options.credentialEnv ?? process.env;
     this.apiToken = options.apiToken ?? readEnvString('PIPEDRIVE_API_TOKEN', credentialEnv);
     this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.apiToken);
-    const allowCustom = options.allowCustomBaseUrl ?? readEnvBoolean('PIPEDRIVE_ALLOW_CUSTOM_BASE_URL', false);
     this.baseUrl = trimTrailingSlash(options.baseUrl ?? readEnvString('PIPEDRIVE_BASE_URL', credentialEnv) ?? DEFAULT_BASE_URL);
-    assertSafeUrl(this.baseUrl, API_HOST, 'PIPEDRIVE_BASE_URL', allowCustom);
+    assertSafeUrl(this.baseUrl, API_HOST, 'PIPEDRIVE_BASE_URL', options.allowLoopback === true);
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'PIPEDRIVE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
     this.maxResponseBytes = intOption(
@@ -526,12 +529,11 @@ function trimTrailingSlash(value: string): string {
 }
 
 /**
- * A URL a token may be sent to: https on exactly `host` (Pipedrive's documented
- * API host), no credentials, query or fragment. Loopback http is allowed
- * for local mocks; another host only with allowCustomHost. The value is
- * never quoted: it is configuration.
+ * A URL a token may be sent to: https on exactly `host` (Pipedrive's API host), no credentials, query or fragment.
+ * A loopback address only with allowLoopback (tests). No other host can be configured. The value is never quoted: it
+ * is configuration.
  */
-function assertSafeUrl(value: string, host: string, name: string, allowCustomHost: boolean): void {
+function assertSafeUrl(value: string, host: string, name: string, allowLoopback: boolean): void {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -541,12 +543,12 @@ function assertSafeUrl(value: string, host: string, name: string, allowCustomHos
   if (parsed.username || parsed.password || value.includes('?') || value.includes('#')) {
     throw new ConfigError(`${name} must not contain credentials, a query string or a fragment.`);
   }
-  if (isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) return;
+  if (allowLoopback && isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) return;
   if (parsed.protocol !== 'https:') {
     throw new ConfigError(`Refusing to send a token over a scheme other than https://. ${name} must use https://.`);
   }
-  if (parsed.hostname.toLowerCase() === host || allowCustomHost) return;
-  throw new ConfigError(`Refusing to send a token to that host: ${name} must be on ${host}. Set PIPEDRIVE_ALLOW_CUSTOM_BASE_URL=true to allow another host.`);
+  if (parsed.hostname.toLowerCase() === host) return;
+  throw new ConfigError(`Refusing to send a token to that host: ${name} must be on ${host}.`);
 }
 
 function isLocalHost(hostname: string): boolean {

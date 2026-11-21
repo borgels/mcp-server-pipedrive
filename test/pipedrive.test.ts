@@ -167,6 +167,28 @@ describe('connection, users and pipelines', () => {
   });
 });
 
+describe('the address', () => {
+  it('a gateway takes no other address than api.pipedrive.com, and nothing is sent', () => {
+    const fetchImpl = vi.fn();
+    for (const baseUrl of ['https://evil.test', 'http://127.0.0.1:8080', 'https://api.pipedrive.com.evil.test', 'https://eksempel.pipedrive.com', 'https://api.pipedrive.com/v1']) {
+      expect(() => createPipedriveGateway({ apiToken: TOKEN, baseUrl, fetchImpl } as never), baseUrl).toThrow();
+      expect(() => createPipedriveGateway({ apiToken: TOKEN, baseUrl, allowLoopback: true, allowCustomBaseUrl: true, fetchImpl } as never), baseUrl).toThrow();
+    }
+    expect(() => createPipedriveGateway({ apiToken: TOKEN, baseUrl: 'https://api.pipedrive.com/', fetchImpl } as never)).not.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('says when there are more pipelines or stages than it reads', async () => {
+    const { gw } = pipedrive({
+      [`GET ${V2}/pipelines`]: ok([{ id: 1, name: 'Salg', order_nr: 1 }], { next_cursor: null }),
+      [`GET ${V2}/stages`]: ok([{ id: 10, name: 'Kontakt', order_nr: 1, pipeline_id: 1 }], { next_cursor: 'more' }),
+    });
+    const result = (await call(gw, 'list_pipelines')).structuredContent as { incomplete?: boolean; pipelines: unknown[] };
+    expect(result.incomplete).toBe(true);
+    expect(result.pipelines).toHaveLength(1);
+  });
+});
+
 describe('reading records', () => {
   it('lists deals with exact filters, newest change first, and gives on only the fixed fields', async () => {
     const { gw, calls } = pipedrive({ [`GET ${V2}/deals`]: ok([DEAL], { next_cursor: 'eyJpZCI6MjN9' }) });
@@ -498,14 +520,18 @@ describe('writes', () => {
     });
   });
 
-  it('update a person and give the old primary e-mail back as the text the tool takes', async () => {
+  it('update a person and give every old e-mail address back, with labels and the primary mark', async () => {
+    const two = [
+      { value: 'testa@eksempel.test', primary: true, label: 'work' },
+      { value: 'privat@eksempel.test', primary: false, label: 'home' },
+    ];
     const { gw, calls } = pipedrive({
-      [`GET ${V2}/persons/21`]: ok(PERSON),
+      [`GET ${V2}/persons/21`]: ok({ ...PERSON, emails: two }),
       [`PATCH ${V2}/persons/21`]: ok({ ...PERSON, emails: [{ value: 'ny@eksempel.test', primary: true }] }),
     });
     const result = await call(gw, 'update_person', { personId: 21, email: 'ny@eksempel.test', orgId: null });
     expect(calls[1]?.body).toEqual({ emails: [{ value: 'ny@eksempel.test', primary: true, label: 'work' }], org_id: null });
-    expect(result.structuredContent).toMatchObject({ before: { email: 'testa@eksempel.test', orgId: 22 } });
+    expect(result.structuredContent).toMatchObject({ before: { email: two, orgId: 22 } });
   });
 
   it('create an organization with the address as one line', async () => {

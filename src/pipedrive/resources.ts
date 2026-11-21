@@ -433,23 +433,31 @@ export async function listUsers(client: UpstreamClient, input: { activeOnly?: bo
   };
 }
 
-/** At most this many pages of stages are read (500 each). */
-const MAX_STAGE_PAGES = 5;
+/** At most this many pages of pipelines and of stages are read (500 each); more is said in the answer. */
+const MAX_PAGES = 5;
 
-/** The pipelines with their stages in order (GET /api/v2/pipelines and /api/v2/stages). */
-export async function listPipelines(client: UpstreamClient): Promise<Json> {
-  const pipelines = parse(v2List(pipeline), await client.get(`${V2}/pipelines`, { limit: 500 }));
-  const stages: Array<z.infer<typeof stage>> = [];
+/** Every page of a v2 list, up to MAX_PAGES; `complete` is false when there was more. */
+async function allPages<S extends z.ZodType>(client: UpstreamClient, path: string, row: S): Promise<{ rows: Array<z.infer<S>>; complete: boolean }> {
+  const rows: Array<z.infer<S>> = [];
   let cursor: string | null = null;
-  for (let page = 0; page < MAX_STAGE_PAGES; page += 1) {
-    const answer = parse(v2List(stage), await client.get(`${V2}/stages`, { limit: 500, cursor }));
-    stages.push(...(answer.data ?? []));
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const answer = parse(v2List(row), await client.get(path, { limit: 500, cursor }));
+    rows.push(...((answer.data ?? []) as Array<z.infer<S>>));
     cursor = nextCursor(answer.additional_data?.next_cursor);
-    if (cursor === null) break;
+    if (cursor === null) return { rows, complete: true };
   }
+  return { rows, complete: false };
+}
+
+/** The pipelines with their stages in order (GET /api/v2/pipelines and /api/v2/stages, every page). */
+export async function listPipelines(client: UpstreamClient): Promise<Json> {
+  const pipelines = await allPages(client, `${V2}/pipelines`, pipeline);
+  const stagePages = await allPages(client, `${V2}/stages`, stage);
+  const stages = stagePages.rows;
   const order = (entry: { order_nr?: number | null }) => entry.order_nr ?? 0;
   return {
-    pipelines: (pipelines.data ?? [])
+    ...(pipelines.complete && stagePages.complete ? {} : { incomplete: true, note: 'More pipelines or stages than one answer holds; not all are shown.' }),
+    pipelines: pipelines.rows
       .filter(entry => !entry.is_deleted)
       .sort((a, b) => order(a) - order(b))
       .map(entry => ({
@@ -677,16 +685,23 @@ function body(type: RecordType, input: Json): { body: Json; given: string[] } {
   return { body: out, given };
 }
 
-/** The value a field had, as the tool takes it, so passing it back undoes the change. */
-function previousValue(type: RecordType, upstream: string, before: Json): unknown {
-  const value = before[upstream];
+/**
+ * The value a field had, in full as Pipedrive gave it: every e-mail address and phone number with its label and
+ * primary mark, the whole address, every participant. A user can restore it in Pipedrive from this; a field the tool
+ * sets as one value (an e-mail, a phone, an address line, the primary participant) is given as more than one value
+ * here when it had more.
+ */
+function previousValue(upstream: string, before: Json): unknown {
   if (upstream === 'emails' || upstream === 'phones') {
-    const list = Array.isArray(value) ? (value as Array<{ value?: string; primary?: boolean }>) : [];
-    return (list.find(entry => entry.primary) ?? list[0])?.value ?? null;
+    const list = Array.isArray(before[upstream]) ? (before[upstream] as Array<z.infer<typeof contact>>) : [];
+    return contacts(list) ?? [];
   }
-  if (upstream === 'address') return (value as { value?: string } | null | undefined)?.value ?? null;
-  if (upstream === 'participants') return type === 'activities' ? (before.person_id ?? null) : null;
-  return value ?? null;
+  if (upstream === 'participants') {
+    const list = Array.isArray(before.participants) ? (before.participants as Array<{ person_id?: number | null; primary?: boolean | null }>) : [];
+    return list.filter(entry => typeof entry.person_id === 'number').map(entry => compact([['person_id', entry.person_id], ['primary', entry.primary ?? undefined]]));
+  }
+  if (upstream === 'note') return typeof before.note === 'string' ? noteText(before.note) : (before.note ?? null);
+  return before[upstream] ?? null;
 }
 
 /** Create a deal, person, organization or activity (POST /api/v2/{type}); the answer is the new record. */
@@ -712,7 +727,7 @@ export async function updateRecord(client: UpstreamClient, type: RecordType, rec
   const previous: Json = {};
   for (const [field, upstream] of WRITE_FIELDS[type]) {
     if (input[field] === undefined) continue;
-    previous[field] = previousValue(type, upstream, before);
+    previous[field] = previousValue(upstream, before);
   }
   const raw = await client.patch(recordPath(type, recordId), payload);
   const after = v2One(SCHEMAS[type]).safeParse(nestedFailuresAsStatus(raw));

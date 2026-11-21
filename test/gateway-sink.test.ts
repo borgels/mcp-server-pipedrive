@@ -180,17 +180,17 @@ describe('round 8', () => {
   });
 
   it('quotes no configured address in network, timeout or redirect errors', async () => {
-    const ADDRESS = 'https://api.vendor-name.invalid/v1';
+    const ADDRESS = 'https://api.pipedrive.com';
     for (const fetchImpl of [
       async () => {
         throw new TypeError('fetch failed', { cause: Object.assign(new Error('x'), { code: 'ENOTFOUND' }) });
       },
       async () => new Response(null, { status: 302, headers: { location: 'https://elsewhere.invalid/' } }),
     ] as Array<typeof fetch>) {
-      const gw = testGateway({ apiToken: PLAIN, baseUrl: ADDRESS, allowCustomBaseUrl: true, maxAttempts: 1, fetchImpl });
+      const gw = testGateway({ apiToken: PLAIN, baseUrl: ADDRESS, maxAttempts: 1, fetchImpl });
       const result = await gw.callTool('get_deal', { dealId: 11 });
       expect(result.isError).toBe(true);
-      expect(JSON.stringify(result)).not.toContain('vendor-name');
+      expect(JSON.stringify(result)).not.toContain('api.pipedrive');
     }
   });
 });

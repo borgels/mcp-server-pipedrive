@@ -111,13 +111,18 @@ describe('PipedriveClient', () => {
   });
 
   it('pins the token to the Pipedrive API host', () => {
-    delete process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL;
     expect(() => pc({ baseUrl: BASE })).not.toThrow();
     expect(() => pc({ baseUrl: 'https://API.PIPEDRIVE.COM' })).not.toThrow();
     expect(() => pc({ baseUrl: 'https://api.pipedrive.com.evil.test' })).toThrow(/must be on/);
     expect(() => pc({ baseUrl: 'https://evil.api.pipedrive.com' })).toThrow(/must be on/);
     expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/must be on/);
-    expect(() => pc({ baseUrl: 'https://evil.test', allowCustomBaseUrl: true })).not.toThrow();
+    // No option or variable lets another host through; the old switch is not read.
+    process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL = 'true';
+    expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://evil.test', allowCustomBaseUrl: true } as never)).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api' })).toThrow();
+    expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api', allowLoopback: true })).not.toThrow();
+    expect(() => pc({ baseUrl: 'https://evil.test', allowLoopback: true })).toThrow(/must be on/);
   });
 
   it('sends only the writes on its fixed list, refused before the token is sent, and has no DELETE', async () => {
@@ -192,9 +197,9 @@ describe('PipedriveClient', () => {
     expect(() => pc({ baseUrl: 'http://api.vendor.test' })).toThrow('https://');
     expect(() => pc({ baseUrl: 'http://api.pipedrive.com' })).toThrow('https://');
     expect(() => pc({ baseUrl: 'not a url' })).toThrow('not a valid URL');
-    expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api' })).not.toThrow();
-    expect(() => pc({ baseUrl: 'http://localhost:8080/api' })).not.toThrow();
-    expect(() => pc({ baseUrl: 'http://[::1]:8080/api' })).not.toThrow();
+    expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api', allowLoopback: true })).not.toThrow();
+    expect(() => pc({ baseUrl: 'http://localhost:8080/api', allowLoopback: true })).not.toThrow();
+    expect(() => pc({ baseUrl: 'http://[::1]:8080/api', allowLoopback: true })).not.toThrow();
 
     for (const baseUrl of [
       'https://user:hunter2@api.vendor.test/v1',
@@ -224,9 +229,6 @@ describe('PipedriveClient', () => {
     process.env.PIPEDRIVE_MAX_RESPONSE_BYTES = '10MB';
     expect(() => pc({})).toThrow('PIPEDRIVE_MAX_RESPONSE_BYTES');
     delete process.env.PIPEDRIVE_MAX_RESPONSE_BYTES;
-    process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL = 'perhaps';
-    expect(() => pc({ baseUrl: BASE })).toThrow('PIPEDRIVE_ALLOW_CUSTOM_BASE_URL');
-    delete process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL;
 
     expect(() => pc({ maxConcurrency: 0 })).toThrow('maxConcurrency');
     expect(() => pc({ maxConcurrency: Number.NaN })).toThrow('maxConcurrency');
@@ -557,7 +559,7 @@ describe('against a local upstream (real sockets)', () => {
       }
       res.writeHead(302, { location: `${base}/contacts/1` }).end();
     });
-    const client = pc({ apiToken: 'fake-local-key-1111', baseUrl: base });
+    const client = pc({ apiToken: 'fake-local-key-1111', baseUrl: base, allowLoopback: true });
 
     await expect(client.get('/contacts/1')).resolves.toEqual({ id: '1' });
     await expect(client.get('/moved')).rejects.toThrow('redirects are not followed');
@@ -571,7 +573,7 @@ describe('against a local upstream (real sockets)', () => {
     const base = await startUpstream(() => {
       // never answers
     });
-    const client = pc({ baseUrl: base, timeoutMs: 100, maxAttempts: 1 });
+    const client = pc({ baseUrl: base, timeoutMs: 100, maxAttempts: 1, allowLoopback: true });
     await expect(client.get('/slow')).rejects.toThrow(/timed out after 100 ms/);
     upstream?.closeAllConnections();
   });

@@ -58,7 +58,6 @@ describe('instance policy from the host', () => {
     process.env.PIPEDRIVE_ENABLE_WRITES = 'true';
     process.env.PIPEDRIVE_DISABLED_TOOLS = 'get_deal';
     process.env.PIPEDRIVE_AUDIT_LOG = join(dir, 'audit.jsonl');
-    process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL = 'true';
 
     const reads = await envReads(async () => {
       const gw = testGateway({ apiToken: KEY, baseUrl: BASE, fetchImpl: routes() as unknown as typeof fetch, policy: {} });
@@ -70,7 +69,7 @@ describe('instance policy from the host', () => {
       expect(texts(write).join(' ')).toMatch(/host has not enabled writes/);
     });
 
-    for (const name of ['PIPEDRIVE_ENABLE_WRITES', 'PIPEDRIVE_DISABLED_TOOLS', 'PIPEDRIVE_AUDIT_LOG', 'PIPEDRIVE_ALLOW_CUSTOM_BASE_URL']) {
+    for (const name of ['PIPEDRIVE_ENABLE_WRITES', 'PIPEDRIVE_DISABLED_TOOLS', 'PIPEDRIVE_AUDIT_LOG']) {
       expect(reads.has(name), name).toBe(false);
     }
     expect(existsSync(join(dir, 'audit.jsonl'))).toBe(false);
