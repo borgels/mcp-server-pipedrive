@@ -1,6 +1,6 @@
 import { z } from 'zod/v4';
 import { UNTRUSTED_CONTENT_NOTE } from './pipedrive/annotations.js';
-import { DEFAULT_BASE_URL, PipedriveClient, type PipedriveClientOptions } from './pipedrive/client.js';
+import { DEFAULT_BASE_URL, PipedriveClient, isCompanyHost, refreshTokenSecret, type PipedriveClientOptions } from './pipedrive/client.js';
 import {
   isToolDisabled,
   resolveInstancePolicy,
@@ -131,9 +131,26 @@ export interface GatewayToolCatalogEntry {
   readonly change?: PipedriveChangeSpec;
 }
 
-export interface PipedriveGatewayOptions extends Omit<PipedriveClientOptions, 'apiToken' | 'credentialEnv' | 'allowLoopback'> {
-  /** The personal API token of a Pipedrive user. Required; a secret; never read from the environment. */
-  apiToken: string;
+/** OAuth access for one user: the app's credentials, the user's refresh token and the user's company address. */
+export interface PipedriveGatewayOAuth {
+  /** The app's client id from Pipedrive's Developer Hub. */
+  clientId: string;
+  /** The app's client secret. A secret. */
+  clientSecret: string;
+  /** The user's refresh token. A secret. */
+  refreshToken: string;
+  /** The user's company address, `api_domain` from the token answer: https://<company>.pipedrive.com. */
+  apiDomain: string;
+}
+
+export interface PipedriveGatewayOptions
+  extends Omit<PipedriveClientOptions, 'apiToken' | 'oauth' | 'credentialEnv' | 'allowLoopback' | 'tokenUrl' | 'now' | 'baseUrl'> {
+  /** The personal API token of a Pipedrive user; a secret; never read from the environment. Give this or `oauth`. */
+  apiToken?: string;
+  /** OAuth access for one user through a registered app. Give this or `apiToken`. */
+  oauth?: PipedriveGatewayOAuth;
+  /** With an API token only: https://api.pipedrive.com, the default and the only address accepted. */
+  baseUrl?: string;
   /**
    * Instance policy from the host. When given, the instance reads no policy
    * or audit variables from the environment (see InstancePolicy). A host
@@ -269,29 +286,68 @@ export function resolvePipedriveChange(
   };
 }
 
-function admittedToken(options: PipedriveGatewayOptions): string {
-  const value: unknown = (options as Partial<PipedriveGatewayOptions> | undefined)?.apiToken;
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw new ConfigError('createPipedriveGateway requires options.apiToken. Embedded instances do not read credentials from the environment.');
-  }
-  // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
-  // ours. Checked before anything is built from the key; the refusal is a fixed text that holds no piece of it.
-  if (!admitsKey(value.trim())) {
-    throw new ConfigError(keyRefusedText(value.trim()));
-  }
-  return value.trim();
+/** The admitted credential: an API token, or OAuth access with its secrets admitted one by one. */
+type Admitted = { kind: 'token'; apiToken: string } | { kind: 'oauth'; oauth: PipedriveGatewayOAuth; secrets: string[] };
+
+/**
+ * Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
+ * ours. Checked before anything is built from a secret; the refusal is a fixed text that holds no piece of it.
+ */
+function admitted(value: string): string {
+  if (!admitsKey(value)) throw new ConfigError(keyRefusedText(value));
+  return value;
 }
 
-/** The given form of the token, admitted or not, so every error can be masked against it. */
+function admittedCredential(options: PipedriveGatewayOptions): Admitted {
+  const given = options as Partial<PipedriveGatewayOptions> | undefined;
+  const token: unknown = given?.apiToken;
+  const oauth: unknown = given?.oauth;
+  if (token !== undefined && oauth !== undefined) {
+    throw new ConfigError('createPipedriveGateway takes options.apiToken or options.oauth, not both.');
+  }
+  if (oauth !== undefined) {
+    const o = (oauth ?? {}) as Partial<Record<keyof PipedriveGatewayOAuth, unknown>>;
+    const text = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+    const clientId = text(o.clientId);
+    const clientSecret = text(o.clientSecret);
+    const refreshToken = text(o.refreshToken);
+    const apiDomain = text(o.apiDomain);
+    if (!clientId || !clientSecret || !refreshToken || !apiDomain) {
+      throw new ConfigError('createPipedriveGateway requires oauth.clientId, oauth.clientSecret, oauth.refreshToken and oauth.apiDomain.');
+    }
+    if (!/^[\x21-\x7e]{1,200}$/.test(clientId)) throw new ConfigError('oauth.clientId is not a client id.');
+    if (!isCompanyAddress(apiDomain)) throw new ConfigError('oauth.apiDomain must be the company address at Pipedrive (https://<company>.pipedrive.com).');
+    const secret = admitted(clientSecret);
+    const grant = admitted(refreshTokenSecret(refreshToken));
+    if (grant === secret) throw new ConfigError(keyRefusedText(secret));
+    return { kind: 'oauth', oauth: { clientId, clientSecret, refreshToken, apiDomain: apiDomain.replace(/\/+$/, '') }, secrets: [secret, grant] };
+  }
+  if (typeof token !== 'string' || token.trim() === '') {
+    throw new ConfigError(
+      'createPipedriveGateway requires options.apiToken or options.oauth. Embedded instances do not read credentials from the environment.',
+    );
+  }
+  return { kind: 'token', apiToken: admitted(token.trim()) };
+}
+
+/** The given forms of the secrets, admitted or not, so every error can be masked against them. */
 function givenSecrets(options: PipedriveGatewayOptions): string[] {
-  const value: unknown = (options as Partial<PipedriveGatewayOptions> | undefined)?.apiToken;
-  return typeof value === 'string' && value !== '' ? [value, value.trim()] : [];
+  const given = options as Partial<PipedriveGatewayOptions> | undefined;
+  const o = (given?.oauth ?? {}) as Partial<Record<keyof PipedriveGatewayOAuth, unknown>>;
+  const forms: string[] = [];
+  for (const value of [given?.apiToken, o.clientSecret, o.refreshToken]) {
+    if (typeof value !== 'string' || value === '') continue;
+    forms.push(value, value.trim());
+    if (value === o.refreshToken) forms.push(refreshTokenSecret(value.trim()));
+  }
+  return forms;
 }
 
 /**
- * Create one gateway instance for one Pipedrive account. `apiToken` is
- * required and is the only credential the instance uses; a missing value
- * fails here.
+ * Create one gateway instance for one Pipedrive user: with the user's API
+ * token, or with OAuth access through a registered app (`oauth`). One of the
+ * two is required and is the only credential the instance uses; a missing
+ * value fails here.
  */
 export function createPipedriveGateway(options: PipedriveGatewayOptions) {
   let firstSecret: string | undefined;
@@ -314,15 +370,16 @@ export function createPipedriveGateway(options: PipedriveGatewayOptions) {
         ? !admitsKey(pseudonymKey)
         : pseudonymForms.some(form => /^[ -~]+$/.test(form) && !admitsKey(form));
     if (refused) throw new ConfigError(PSEUDONYM_KEY_REFUSED);
-    // Admission of the token, before a redactor is built from it.
-    const apiToken = admittedToken(options);
-    firstSecret = apiToken;
-    guard.addSecret(apiToken);
+    // Admission of the credential, before a redactor is built from it.
+    const credential = admittedCredential(options);
+    const admittedSecrets = credential.kind === 'token' ? [credential.apiToken] : credential.secrets;
+    firstSecret = admittedSecrets[0];
+    for (const secret of admittedSecrets) guard.addSecret(secret);
     // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
     if (leaksSecret(fixedOutputs(), guard)) {
       throw new ConfigError(refusal());
     }
-    const gateway = buildGateway(options, apiToken);
+    const gateway = buildGateway(options, credential);
     // The tool list leaves the gateway as it is: a key that shares a piece with it is refused.
     if (leaksSecret(gateway.tools, guard)) {
       throw new ConfigError(refusal());
@@ -362,8 +419,8 @@ function addKeyMaterial(redactor: SecretRedactor, key: string | Uint8Array): voi
   for (const form of keyForms(key)) redactor.addSecret(form);
 }
 
-function buildGateway(options: PipedriveGatewayOptions, apiToken: string) {
-  const { policy: hostPolicy, apiToken: _t, ...clientOptions } = options;
+function buildGateway(options: PipedriveGatewayOptions, credential: Admitted) {
+  const { policy: hostPolicy, apiToken: _t, oauth: _o, ...clientOptions } = options;
   const policy =
     hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, PIPEDRIVE_TOOLS.map(tool => tool.name));
   if (policy === undefined) {
@@ -371,13 +428,27 @@ function buildGateway(options: PipedriveGatewayOptions, apiToken: string) {
     // validates against the environment, never against that instance's policy.
     runInCallScope({}, () => validateStartupConfig());
   }
-  // Only Pipedrive's own address: a base URL other than https://api.pipedrive.com is refused here, so the token cannot
-  // be sent anywhere else, whatever the host passes.
-  const { allowLoopback: _loopback, ...rest } = clientOptions as typeof clientOptions & { allowLoopback?: unknown };
-  if (rest.baseUrl !== undefined && !isPipedriveAddress(rest.baseUrl)) {
-    throw new ConfigError(`createPipedriveGateway accepts only ${DEFAULT_BASE_URL} as baseUrl.`);
+  // Only Pipedrive's own addresses: with an API token https://api.pipedrive.com, with OAuth the user's company address
+  // and oauth.pipedrive.com. Anything else is refused here, so no secret can be sent elsewhere, whatever the host passes.
+  const {
+    allowLoopback: _loopback,
+    tokenUrl: _tokenUrl,
+    now: _now,
+    ...rest
+  } = clientOptions as typeof clientOptions & { allowLoopback?: unknown; tokenUrl?: unknown; now?: unknown };
+  if (rest.baseUrl !== undefined && (credential.kind === 'oauth' || !isPipedriveAddress(rest.baseUrl))) {
+    throw new ConfigError(`createPipedriveGateway accepts only ${DEFAULT_BASE_URL} as baseUrl, and none with OAuth access.`);
   }
-  const client = new PipedriveClient({ ...rest, apiToken, credentialEnv: {}, allowLoopback: false });
+  const client =
+    credential.kind === 'token'
+      ? new PipedriveClient({ ...rest, apiToken: credential.apiToken, credentialEnv: {}, allowLoopback: false })
+      : new PipedriveClient({
+          ...rest,
+          baseUrl: credential.oauth.apiDomain,
+          oauth: { clientId: credential.oauth.clientId, clientSecret: credential.oauth.clientSecret, refreshToken: credential.oauth.refreshToken },
+          credentialEnv: {},
+          allowLoopback: false,
+        });
   const redactor: SecretRedactor = client.redactor;
   // The host's pseudonym key is a secret like the access token: kept out of results, logs and errors.
   if (policy?.pseudonymKey !== undefined) addKeyMaterial(redactor, policy.pseudonymKey);
@@ -446,6 +517,22 @@ function buildGateway(options: PipedriveGatewayOptions, apiToken: string) {
 }
 
 /** Whether a base URL is Pipedrive's own address (https://api.pipedrive.com, a trailing slash allowed). */
+/** A company address at Pipedrive, as `api_domain` gives it: https, a company host, nothing else. */
+function isCompanyAddress(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      isCompanyHost(url.hostname.toLowerCase()) &&
+      url.port === '' &&
+      (url.pathname === '/' || url.pathname === '') &&
+      !url.username && !url.password && !value.includes('?') && !value.includes('#')
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isPipedriveAddress(value: unknown): boolean {
   if (typeof value !== 'string') return false;
   try {

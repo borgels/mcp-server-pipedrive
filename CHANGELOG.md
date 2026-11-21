@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+- The gateway can use OAuth access for one user through an app registered in
+  Pipedrive's Developer Hub, instead of an API token: `oauth` with the app's
+  client id and secret, the user's refresh token and the user's company
+  address (`api_domain`). The client renews the access token at
+  `oauth.pipedrive.com/oauth/token` with HTTP Basic auth, keeps it for its
+  lifetime (60 minutes), renews once and sends again on a 401, and sends it as
+  a Bearer token only to `https://<company>.pipedrive.com`. A refused renewal
+  is a 401 in the server's own words. A refresh token of the form
+  `<id>:<id>:<secret>` has only its last part treated as secret, so the ids in
+  ordinary answers are not withheld.
+- The standalone server still takes an API token from the environment.
+
 ## 0.1.1
 
 - An organization's address is read with every documented field (street,

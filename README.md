@@ -5,7 +5,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for [Pipedriv
 > This is an independent, unofficial project. It is not developed, endorsed or supported by Pipedrive. It uses only Pipedrive's public API.
 
 - Read-only by default; writes are opt-in per instance, and every write can be undone in Pipedrive (a new record, a changed field, a moved deal, an activity marked done). No delete, merge, bulk change, e-mail, invitation, or change to users, permissions, pipelines, stages, fields, filters, products or webhooks, whatever the configuration.
-- One personal API token per server instance, sent only to `api.pipedrive.com` in the `x-api-token` header; the server does no per-user authorization itself (see [Security model](#security-model)).
+- One personal API token per server instance, sent only to `api.pipedrive.com` in the `x-api-token` header; or, embedded through `./gateway`, OAuth access for one user through a registered app, sent only to that user's company address. The server does no per-user authorization itself (see [Security model](#security-model)).
 - Two transports: stdio for local clients, stateless streamable HTTP for containers and gateways.
 - Embeddable: the `./gateway` export exposes the same tools, validation, policy and audit to a host application.
 
@@ -44,7 +44,7 @@ The server takes one **personal API token**: in Pipedrive, the user opens *Perso
 
 The token goes in the `x-api-token` header, as Pipedrive's documentation asks, and only to `api.pipedrive.com` (Pipedrive finds the company from the token, so no company address is needed).
 
-No OAuth app is used. Under Pipedrive's Developer Agreement, an app distributed commercially is a Marketplace app and needs Pipedrive's approval, even when unlisted; see [Sources](#sources).
+The standalone server uses the API token. An embedding host can instead give each gateway OAuth access for one user through an app registered in Pipedrive's Developer Hub (see [Embedding](#embedding-gateway)): the app's client id and secret, the user's refresh token and the user's company address (`api_domain` from the token answer). The client renews the access token at `oauth.pipedrive.com` with HTTP Basic auth (an access token lives 60 minutes; the refresh token stays the same and lasts 60 days from its last use) and sends it as `Authorization: Bearer` only to `https://<company>.pipedrive.com`. Under Pipedrive's Developer Agreement, an app distributed commercially is a Marketplace app and needs Pipedrive's approval, even when unlisted; see [Sources](#sources).
 
 ## Quick start
 
@@ -156,7 +156,7 @@ const gateway = createPipedriveGateway({
 const result = await gateway.callTool('search_deals', { status: 'won' }, { caller: 'user-1' });
 ```
 
-- **Explicit credentials.** `apiToken` is required; a missing value throws when the gateway is created. It passes key admission. A gateway never reads `PIPEDRIVE_*` credentials or addresses from the environment, so one tenant cannot silently fall back to the process's credentials. The stdio and HTTP transports still read them from the environment.
+- **Explicit credentials.** `apiToken` or `oauth` (`clientId`, `clientSecret`, `refreshToken`, `apiDomain`) is required, not both; a missing value throws when the gateway is created. The secrets pass key admission, and `apiDomain` must be a company address at Pipedrive. A gateway never reads `PIPEDRIVE_*` credentials or addresses from the environment, so one tenant cannot silently fall back to the process's credentials. The stdio and HTTP transports still read them from the environment.
 - **Several tenants in one process.** Create one gateway per API token. Each instance redacts error text, tool results and audit records with its own key only; no secret is kept in a process-wide registry, and a dropped instance releases its key.
 - **Instance policy from the host.** Pass `policy` to `createPipedriveGateway`: `enableWrites` (default false), `disabledTools` (must name known tools) and `audit`, a function that receives each audit record instead of `PIPEDRIVE_AUDIT_LOG` (without it the instance writes no audit; a write tool does not run if the sink throws on its start record). An instance with `policy` reads none of `PIPEDRIVE_ENABLE_WRITES`, `PIPEDRIVE_DISABLED_TOOLS`, or `PIPEDRIVE_AUDIT_LOG`, so tenants in one process can have different settings. Without `policy` the instance uses the environment, like the MCP server. Each call runs in a scope of its own, so a call made from inside another instance's call never inherits its policy, sink or redactor, and every audit record is redacted as a whole with the instance's own key before the sink sees it. The limits (`PIPEDRIVE_TIMEOUT_MS`, ...) are still read from the environment and apply to every gateway in the process. Per-user and per-tenant authorization is the host's job.
 - **Result format.** A successful `callTool` result has `structuredContent` and one text block: a short summary, a blank line, and the same data as compact JSON, as the MCP specification recommends (many clients read only the text). The JSON is built from the redacted result, so it holds exactly `structuredContent`. An error result has only its text.
@@ -236,6 +236,7 @@ Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 Built from Pipedrive's public documentation (read 21.11.2026). The tests use answers shaped as documented; `test/live.test.ts` runs the tools against a real test company when `PIPEDRIVE_TEST_API_TOKEN` is set (in CI from the repository secret of that name; without it the job passes with a notice).
 
 - API token, header and where to find it: <https://pipedrive.readme.io/docs/core-api-concepts-authentication>, <https://pipedrive.readme.io/docs/how-to-find-the-api-token>, <https://pipedrive.readme.io/docs/enabling-api-for-company-users>.
+- OAuth: <https://pipedrive.readme.io/docs/marketplace-oauth-authorization>, <https://pipedrive.readme.io/docs/marketplace-oauth-api>, <https://pipedrive.readme.io/docs/marketplace-scopes-and-permissions-explanations>.
 - API v2 and the migration from v1 (v1 deals, persons, organizations, activities, pipelines and stages are out of support from 01.08.2026): <https://pipedrive.readme.io/docs/pipedrive-api-v2-migration-guide>, <https://developers.pipedrive.com/changelog/post/deprecated-apiv1-endpoints-become-out-of-support>.
 - Reference (deals, persons, organizations, activities, pipelines, stages, search, notes, users): <https://developers.pipedrive.com/docs/api/v1>.
 - Paging and rate limits: <https://pipedrive.readme.io/docs/core-api-concepts-pagination>, <https://pipedrive.readme.io/docs/core-api-concepts-rate-limiting>.

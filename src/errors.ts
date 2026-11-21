@@ -191,7 +191,7 @@ function applyPatterns(value: string, patterns: readonly RegExp[]): string {
 /** Our own guidance per HTTP status. Nothing of the response body (Pipedrive's problem details) is used. */
 const STATUS_HINTS: Record<number, string> = {
   400: 'Pipedrive refused the input (a value Pipedrive does not accept, e.g. an unknown stage, owner or activity type, or a field missing). Check the ids and values. Nothing was changed.',
-  401: 'Pipedrive did not accept the API token. It may have been changed or the user removed; the user copies the current token from Personal preferences, API in Pipedrive.',
+  401: 'Pipedrive did not accept the access. The API token may have been changed, the app removed or the user deactivated; the user connects again.',
   402: 'Pipedrive refused: the company has no active subscription that allows this.',
   403: 'Pipedrive refused access: the user whose token this is may not see or change this, or the company does not let the user use the API. Retrying will not help.',
   404: 'The record was not found, or the user whose token this is cannot see it. Check the ids.',

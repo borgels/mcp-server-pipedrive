@@ -3,17 +3,55 @@ import { PipedriveHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } fr
 import { USER_AGENT } from '../version.js';
 
 /**
- * The client sends one personal API token in the `x-api-token` header, as
- * Pipedrive's documentation asks ("The API token must be provided in the
- * x-api-token header for all requests",
- * https://pipedrive.readme.io/docs/core-api-concepts-authentication). The
- * token belongs to one user in one Pipedrive company and carries that user's
- * permissions. It is never exchanged or renewed, and never put in a URL.
+ * How the client is let in. Pipedrive documents two ways
+ * (https://pipedrive.readme.io/docs/core-api-concepts-authentication):
+ *
+ * - a personal API token, sent in the `x-api-token` header to
+ *   api.pipedrive.com ("The API token must be provided in the x-api-token
+ *   header for all requests"). It belongs to one user in one company and is
+ *   never exchanged or renewed;
+ * - OAuth 2.0 through an app registered in Pipedrive's Developer Hub
+ *   (https://pipedrive.readme.io/docs/marketplace-oauth-authorization): the
+ *   client exchanges the user's refresh token for an access token at
+ *   oauth.pipedrive.com, with the app's client id and secret as HTTP Basic
+ *   auth, and sends it as a Bearer token to the user's own company address
+ *   (`api_domain`, https://<company>.pipedrive.com). An access token lives 60
+ *   minutes; the refresh token stays the same and lasts 60 days from its last
+ *   use.
+ *
+ * Either way the access carries the permissions of the one user who gave it,
+ * and no secret is ever put in a URL.
  */
+export interface PipedriveOAuthAccess {
+  /** The app's client id from Developer Hub. Not a secret. */
+  clientId: string;
+  /** The app's client secret. A secret. */
+  clientSecret: string;
+  /** The user's refresh token from the authorization. A secret. */
+  refreshToken: string;
+}
+
 export interface PipedriveClientOptions {
-  /** The personal API token. A secret. When omitted, read from PIPEDRIVE_API_TOKEN. */
+  /** The personal API token. A secret. When omitted (and no `oauth`), read from PIPEDRIVE_API_TOKEN. */
   apiToken?: string;
-  /** API base URL (default https://api.pipedrive.com; env PIPEDRIVE_BASE_URL). */
+  /**
+   * OAuth access instead of an API token. Then `baseUrl` is required and must be the user's company address
+   * (`api_domain` from the token answer, https://<company>.pipedrive.com). Never read from the environment.
+   */
+  oauth?: PipedriveOAuthAccess;
+  /**
+   * OAuth only: called if the token endpoint ever answers with another refresh token than the one in use. Pipedrive
+   * documents that the same one is returned, so this is a safeguard; the client uses the new one from then on.
+   */
+  onRefreshToken?: (refreshToken: string) => void | Promise<void>;
+  /** OAuth only, for tests with allowLoopback: the token endpoint (default https://oauth.pipedrive.com/oauth/token). */
+  tokenUrl?: string;
+  /** Injectable for tests: the clock used for the access token's lifetime. */
+  now?: () => number;
+  /**
+   * API base URL. With an API token: https://api.pipedrive.com (the default; env PIPEDRIVE_BASE_URL). With OAuth: the
+   * user's company address, required.
+   */
   baseUrl?: string;
   /**
    * Where omitted credentials are read from. Defaults to process.env for the
@@ -54,6 +92,51 @@ type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT';
 
 /** The header that carries the API token; error text redaction follows it. */
 export const API_KEY_HEADER = 'x-api-token';
+/** The header that carries an OAuth access token. */
+export const AUTHORIZATION_HEADER = 'Authorization';
+
+/** Pipedrive's OAuth server (exact host) and its token endpoint. */
+export const OAUTH_HOST = 'oauth.pipedrive.com';
+export const TOKEN_URL = `https://${OAUTH_HOST}/oauth/token`;
+
+/**
+ * A company address at Pipedrive, as `api_domain` gives it: one label of letters, digits and hyphens under
+ * pipedrive.com. api.pipedrive.com and oauth.pipedrive.com are Pipedrive's own hosts and are not a company's.
+ */
+const COMPANY_HOST = /^(?!api\.|oauth\.)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.pipedrive\.com$/;
+
+/** Whether `host` (lower case) is a company address at Pipedrive. */
+export function isCompanyHost(host: string): boolean {
+  return COMPANY_HOST.test(host);
+}
+
+/**
+ * The part of a refresh token that is secret. Pipedrive does not document the token's form; if it is
+ * `<digits>:<digits>:<rest>`, the leading numbers are the company's and user's ids, which also appear in ordinary
+ * answers (an owner, a user), so only the rest is treated as the secret. Any other form is secret as a whole.
+ */
+export function refreshTokenSecret(token: string): string {
+  const match = /^\d{1,20}:\d{1,20}:([\x21-\x7e]{16,})$/.exec(token);
+  return match ? (match[1] as string) : token;
+}
+
+/** An access token is renewed this long before it expires. */
+const TOKEN_EARLY_RENEWAL_MS = 60_000;
+/** What a token from Pipedrive may consist of: printable ASCII, within a sane length. */
+const TOKEN_TEXT = /^[\x21-\x7e]{16,8192}$/;
+
+/** The token endpoint did not take the app's credentials or the refresh token: our own text, nothing of the answer. */
+export class PipedriveTokenError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(
+      `Pipedrive API request failed with HTTP 401 | Pipedrive did not renew the access (the token endpoint answered ${status}). ` +
+        'The user may have removed the app or not used it for 60 days; the user connects again.',
+    );
+    this.name = 'PipedriveTokenError';
+    this.status = status;
+  }
+}
 
 /**
  * Pipedrive's API host (exact host match, no subdomains). It serves both
@@ -167,6 +250,14 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
 export class PipedriveClient implements UpstreamClient {
   readonly redactor: SecretRedactor;
   private readonly apiToken?: string;
+  private readonly oauth?: { clientId: string; clientSecret: string; basic: string };
+  private refreshToken?: string;
+  private readonly onRefreshToken?: (refreshToken: string) => void | Promise<void>;
+  private readonly tokenUrl: string;
+  private readonly now: () => number;
+  private access?: { token: string; expiresAt: number };
+  private pendingToken?: Promise<string>;
+  private readonly retired: string[] = [];
   readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
@@ -179,10 +270,31 @@ export class PipedriveClient implements UpstreamClient {
 
   constructor(options: PipedriveClientOptions = {}) {
     const credentialEnv = options.credentialEnv ?? process.env;
-    this.apiToken = options.apiToken ?? readEnvString('PIPEDRIVE_API_TOKEN', credentialEnv);
-    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.apiToken);
-    this.baseUrl = trimTrailingSlash(options.baseUrl ?? readEnvString('PIPEDRIVE_BASE_URL', credentialEnv) ?? DEFAULT_BASE_URL);
-    assertSafeUrl(this.baseUrl, API_HOST, 'PIPEDRIVE_BASE_URL', options.allowLoopback === true);
+    const loopback = options.allowLoopback === true;
+    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addHeader(AUTHORIZATION_HEADER);
+    this.now = options.now ?? Date.now;
+    this.tokenUrl = TOKEN_URL;
+    if (options.oauth !== undefined) {
+      const { clientId, clientSecret, refreshToken } = options.oauth;
+      if (!clientId || !clientSecret || !refreshToken) throw new ConfigError('OAuth access needs a client id, a client secret and a refresh token.');
+      const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+      this.oauth = { clientId, clientSecret, basic };
+      this.refreshToken = refreshToken;
+      this.onRefreshToken = options.onRefreshToken;
+      this.redactor.addSecret(clientSecret).addSecret(basic).addSecret(refreshTokenSecret(refreshToken));
+      if (options.baseUrl === undefined) throw new ConfigError("OAuth access needs the user's company address as baseUrl.");
+      this.baseUrl = trimTrailingSlash(options.baseUrl);
+      assertSafeUrl(this.baseUrl, isCompanyHost, 'baseUrl', loopback);
+      if (options.tokenUrl !== undefined) {
+        assertSafeUrl(options.tokenUrl, host => host === OAUTH_HOST, 'tokenUrl', loopback, true);
+        this.tokenUrl = options.tokenUrl;
+      }
+    } else {
+      this.apiToken = options.apiToken ?? readEnvString('PIPEDRIVE_API_TOKEN', credentialEnv);
+      this.redactor.addSecret(this.apiToken);
+      this.baseUrl = trimTrailingSlash(options.baseUrl ?? readEnvString('PIPEDRIVE_BASE_URL', credentialEnv) ?? DEFAULT_BASE_URL);
+      assertSafeUrl(this.baseUrl, host => host === API_HOST, 'PIPEDRIVE_BASE_URL', loopback);
+    }
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'PIPEDRIVE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
     this.maxResponseBytes = intOption(
@@ -236,11 +348,112 @@ export class PipedriveClient implements UpstreamClient {
         throw new Error(`Refused: ${method} to that Pipedrive path is not among the requests this server sends.`);
       }
     }
+    if (this.oauth) {
+      // A 401 means the access token was not taken and nothing was done: renew it once and send again.
+      for (let attempt = 1; ; attempt += 1) {
+        const token = await this.accessToken();
+        try {
+          return await this.send<T>(method, url, body, { [AUTHORIZATION_HEADER]: `Bearer ${token}` });
+        } catch (error) {
+          if (attempt === 1 && error instanceof PipedriveHttpError && error.status === 401) {
+            this.dropAccessToken(token);
+            continue;
+          }
+          throw error;
+        }
+      }
+    }
     if (!this.apiToken) throw new Error('Missing PIPEDRIVE_API_TOKEN. Set it in the MCP server environment.');
+    return this.send<T>(method, url, body, { [API_KEY_HEADER]: this.apiToken });
+  }
+
+  /** The access token in use, renewed when it is about to expire. One renewal at a time per client. */
+  private async accessToken(): Promise<string> {
+    if (this.access && this.access.expiresAt - TOKEN_EARLY_RENEWAL_MS > this.now()) return this.access.token;
+    this.pendingToken ??= this.renewAccessToken().finally(() => {
+      this.pendingToken = undefined;
+    });
+    return this.pendingToken;
+  }
+
+  /** Forget the access token (after a 401), so the next request renews it. */
+  private dropAccessToken(token: string): void {
+    if (this.access?.token === token) this.access = undefined;
+  }
+
+  /**
+   * The refresh grant at Pipedrive's token endpoint, form-encoded with the app's credentials as HTTP Basic auth, as
+   * documented. Never retried, never redirected; the answer's own text is never read into an error.
+   */
+  private async renewAccessToken(): Promise<string> {
+    const oauth = this.oauth as { basic: string };
+    const init: RequestInit = {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        [AUTHORIZATION_HEADER]: `Basic ${oauth.basic}`,
+      },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: this.refreshToken as string }).toString(),
+    };
+    const answer = await this.execute(false, 'POST', this.tokenUrl, init, async response => {
+      if (isRedirect(response.status)) {
+        await discardBody(response);
+        throw new Error(this.redactor.redact(redirectRefusedMessage(response, 'POST', this.tokenUrl)));
+      }
+      if (!response.ok) {
+        await discardBody(response);
+        if (response.status === 400 || response.status === 401) throw new PipedriveTokenError(response.status);
+        throw new PipedriveHttpError({
+          status: response.status,
+          url: describeUrl(this.tokenUrl),
+          retryAfter: response.headers.get('retry-after') ?? undefined,
+        });
+      }
+      return readResponseBody(response, this.maxResponseBytes);
+    });
+    const value = answer && typeof answer === 'object' && !Array.isArray(answer) ? (answer as Record<string, unknown>) : {};
+    const token = value.access_token;
+    if (typeof token !== 'string' || !TOKEN_TEXT.test(token)) {
+      throw new Error('Pipedrive answered the token request without an access token. Nothing in the answer was used.');
+    }
+    if (value.token_type !== undefined && (typeof value.token_type !== 'string' || value.token_type.toLowerCase() !== 'bearer')) {
+      throw new Error('Pipedrive answered the token request with another token type than Bearer. Nothing in the answer was used.');
+    }
+    const expiresIn =
+      typeof value.expires_in === 'number' && Number.isInteger(value.expires_in) && value.expires_in > 0 && value.expires_in <= 86_400
+        ? value.expires_in
+        : 3_600;
+    // Earlier access tokens stay redacted for two renewals (one may still be valid, and errors in flight may hold it);
+    // older ones have expired and are let go.
+    const previous = this.access?.token;
+    this.redactor.addSecret(token);
+    if (previous && previous !== token) {
+      this.retired.push(previous);
+      while (this.retired.length > 2) this.redactor.removeSecret(this.retired.shift() as string);
+    }
+    this.access = { token, expiresAt: this.now() + expiresIn * 1000 };
+    const rotated = value.refresh_token;
+    if (typeof rotated === 'string' && TOKEN_TEXT.test(rotated) && rotated !== this.refreshToken) {
+      this.redactor.addSecret(refreshTokenSecret(rotated));
+      this.refreshToken = rotated;
+      try {
+        const stored: unknown = this.onRefreshToken?.(rotated);
+        if (stored && typeof (stored as Promise<void>).then === 'function') (stored as Promise<void>).then(undefined, () => undefined);
+      } catch {
+        // A host's callback failing does not fail the call; the token is in use in memory.
+      }
+    }
+    return token;
+  }
+
+  /** One request with the given credential header. */
+  private async send<T>(method: HttpMethod, url: string, body: unknown, credential: Record<string, string>): Promise<T> {
     const headers: Record<string, string> = {
       Accept: 'application/json',
       'User-Agent': USER_AGENT,
-      [API_KEY_HEADER]: this.apiToken,
+      ...credential,
     };
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
@@ -529,11 +742,12 @@ function trimTrailingSlash(value: string): string {
 }
 
 /**
- * A URL a token may be sent to: https on exactly `host` (Pipedrive's API host), no credentials, query or fragment.
- * A loopback address only with allowLoopback (tests). No other host can be configured. The value is never quoted: it
- * is configuration.
+ * A URL a token may be sent to: https on a host `host` accepts (api.pipedrive.com for an API token, the user's company
+ * address for OAuth, oauth.pipedrive.com for the token endpoint), no credentials, port, query or fragment, and no path
+ * (but `withPath`, for the token endpoint). A loopback address only with allowLoopback (tests). The value is never
+ * quoted: it is configuration.
  */
-function assertSafeUrl(value: string, host: string, name: string, allowLoopback: boolean): void {
+function assertSafeUrl(value: string, host: (host: string) => boolean, name: string, allowLoopback: boolean, withPath = false): void {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -547,8 +761,11 @@ function assertSafeUrl(value: string, host: string, name: string, allowLoopback:
   if (parsed.protocol !== 'https:') {
     throw new ConfigError(`Refusing to send a token over a scheme other than https://. ${name} must use https://.`);
   }
-  if (parsed.hostname.toLowerCase() === host) return;
-  throw new ConfigError(`Refusing to send a token to that host: ${name} must be on ${host}.`);
+  if (parsed.port !== '' || (!withPath && parsed.pathname !== '/')) {
+    throw new ConfigError(`${name} must not contain a port or a path.`);
+  }
+  if (host(parsed.hostname.toLowerCase())) return;
+  throw new ConfigError(`Refusing to send a token to that host: ${name} is not a Pipedrive address for this access.`);
 }
 
 function isLocalHost(hostname: string): boolean {

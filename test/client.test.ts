@@ -113,16 +113,16 @@ describe('PipedriveClient', () => {
   it('pins the token to the Pipedrive API host', () => {
     expect(() => pc({ baseUrl: BASE })).not.toThrow();
     expect(() => pc({ baseUrl: 'https://API.PIPEDRIVE.COM' })).not.toThrow();
-    expect(() => pc({ baseUrl: 'https://api.pipedrive.com.evil.test' })).toThrow(/must be on/);
-    expect(() => pc({ baseUrl: 'https://evil.api.pipedrive.com' })).toThrow(/must be on/);
-    expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://api.pipedrive.com.evil.test' })).toThrow(/not a Pipedrive address/);
+    expect(() => pc({ baseUrl: 'https://evil.api.pipedrive.com' })).toThrow(/not a Pipedrive address/);
+    expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/not a Pipedrive address/);
     // No option or variable lets another host through; the old switch is not read.
     process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL = 'true';
-    expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/must be on/);
-    expect(() => pc({ baseUrl: 'https://evil.test', allowCustomBaseUrl: true } as never)).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/not a Pipedrive address/);
+    expect(() => pc({ baseUrl: 'https://evil.test', allowCustomBaseUrl: true } as never)).toThrow(/not a Pipedrive address/);
     expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api' })).toThrow();
     expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api', allowLoopback: true })).not.toThrow();
-    expect(() => pc({ baseUrl: 'https://evil.test', allowLoopback: true })).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://evil.test', allowLoopback: true })).toThrow(/not a Pipedrive address/);
   });
 
   it('sends only the writes on its fixed list, refused before the token is sent, and has no DELETE', async () => {
@@ -246,7 +246,7 @@ describe('error handling', () => {
       correlationId: 'corr-id-zzzzzzzzzzzz',
     };
     for (const [status, hint] of [
-      [401, 'Pipedrive did not accept the API token.'],
+      [401, 'Pipedrive did not accept the access.'],
       [403, 'the user whose token this is may not see or change this'],
     ] as const) {
       const fetchImpl = makeFetch(() => jsonResponse(vendor, status));
