@@ -178,6 +178,20 @@ describe('the address', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('follows the cursor of the pipeline list too', async () => {
+    const { gw, calls } = pipedrive({
+      [`GET ${V2}/pipelines`]: (url: URL) =>
+        url.searchParams.get('cursor') === null
+          ? ok([{ id: 1, name: 'Salg', order_nr: 1 }], { next_cursor: 'p2' })
+          : ok([{ id: 2, name: 'Service', order_nr: 2 }], { next_cursor: null }),
+      [`GET ${V2}/stages`]: ok([{ id: 20, name: 'Ny', order_nr: 1, pipeline_id: 2 }], { next_cursor: null }),
+    });
+    const result = (await call(gw, 'list_pipelines')).structuredContent as { incomplete?: boolean; pipelines: Array<{ id: number }> };
+    expect(result.pipelines.map(entry => entry.id)).toEqual([1, 2]);
+    expect(result.incomplete).toBeUndefined();
+    expect(calls.filter(c => c.path === `${V2}/pipelines`).map(c => c.query.get('cursor'))).toEqual([null, 'p2']);
+  });
+
   it('says when there are more pipelines or stages than it reads', async () => {
     const { gw } = pipedrive({
       [`GET ${V2}/pipelines`]: ok([{ id: 1, name: 'Salg', order_nr: 1 }], { next_cursor: null }),
@@ -318,7 +332,14 @@ describe('reading records', () => {
       id: 22,
       name: 'Eksempel ApS',
       owner_id: 7,
-      address: { value: 'Eksempelvej 1, 8000 Aarhus C', postal_code: '8000', locality: 'Aarhus', country: 'Danmark' },
+      address: {
+        value: 'Eksempelvej 1, 8000 Aarhus C',
+        street_number: '1',
+        route: 'Eksempelvej',
+        locality: 'Aarhus',
+        country: 'Danmark',
+        postal_code: '8000',
+      },
       add_time: '2026-11-01T10:00:00Z',
       update_time: '2026-11-02T10:00:00Z',
     });
@@ -532,6 +553,16 @@ describe('writes', () => {
     const result = await call(gw, 'update_person', { personId: 21, email: 'ny@eksempel.test', orgId: null });
     expect(calls[1]?.body).toEqual({ emails: [{ value: 'ny@eksempel.test', primary: true, label: 'work' }], org_id: null });
     expect(result.structuredContent).toMatchObject({ before: { email: two, orgId: 22 } });
+  });
+
+  it('update an organization address and give the whole old address back', async () => {
+    const old = { value: 'Gammelvej 2, 8000 Aarhus C', street_number: '2', route: 'Gammelvej', subpremise: '1. sal', admin_area_level_1: 'Region Midtjylland', postal_code: '8000' };
+    const { gw } = pipedrive({
+      [`GET ${V2}/organizations/22`]: ok({ id: 22, name: 'Eksempel ApS', address: old }),
+      [`PATCH ${V2}/organizations/22`]: ok({ id: 22, name: 'Eksempel ApS', address: { value: 'Nyvej 1' } }),
+    });
+    const result = await call(gw, 'update_organization', { orgId: 22, address: 'Nyvej 1' });
+    expect(result.structuredContent).toMatchObject({ before: { address: old } });
   });
 
   it('create an organization with the address as one line', async () => {

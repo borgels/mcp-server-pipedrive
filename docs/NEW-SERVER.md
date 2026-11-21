@@ -28,7 +28,7 @@ Check that `mcp-server-<name>` is free on npm (`npm view mcp-server-<name>` shou
 
 - `src/<name>/client.ts`: `API_KEY_HEADER` (error text redaction follows it), `UPSTREAM_HOST_SUFFIXES` to pin the hosts the key may be sent to, and a default base URL if the vendor has one fixed host.
 - `src/errors.ts`: the vendor's error model and status or error-code hints; credential key names in `BASE_PATTERNS`. Secret values are never registered globally: each client owns a `SecretRedactor` holding its key and key header.
-- API calls next to `src/<name>/items.ts`; pass every caller-supplied path segment through `encodePathParam`.
+- API calls in `src/<name>/resources.ts`; pass every caller-supplied path segment through `encodePathParam`.
 - Tools in the table in `src/tools/<name>.ts`: strict zod input, correct annotations, and `upstream`, every API request the handler may make. It is published in the gateway tool catalog; the catalog test checks it against the requests each tool makes, so add a sample input there for each new tool. Read-only tools receive a client that refuses non-GET requests; give POST-based searches a dedicated method instead of the full client.
 - Audit fields in `src/<name>/audit.ts`: ids in clear text, free text hashed, payloads by field name only.
 - Policy in `src/<name>/policy.ts`: instance allowlists, if any.
