@@ -1,8 +1,14 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { API_KEY_HEADER, ExampleClient } from '../src/example/client.js';
-import { ExampleHttpError, parseRetryAfterMs, redactSecrets, SecretRedactor } from '../src/errors.js';
+import {
+  ALLOWED_WRITES,
+  API_KEY_HEADER,
+  PipedriveClient,
+  readOnlyClient,
+  type PipedriveClientOptions,
+} from '../src/pipedrive/client.js';
+import { PipedriveHttpError, parseRetryAfterMs, redactSecrets, SecretRedactor } from '../src/errors.js';
 import { USER_AGENT } from '../src/version.js';
 
 const originalEnv = { ...process.env };
@@ -11,7 +17,14 @@ afterEach(() => {
   process.env = { ...originalEnv };
 });
 
-const BASE = 'https://api.vendor.test/v1';
+const BASE = 'https://api.pipedrive.com';
+/** A test token: obviously not a real one. */
+const TOKEN = 'fake-token-aaaaaaaaaaaa';
+
+/** A client with an explicit token, so nothing is read from the environment. */
+function pc(options: Omit<Partial<PipedriveClientOptions>, 'fetchImpl'> & { fetchImpl?: unknown }) {
+  return new PipedriveClient({ apiToken: TOKEN, fetchImpl: fetch, ...options } as PipedriveClientOptions);
+}
 
 type Handler = (url: string, init?: RequestInit) => Response | unknown | Promise<Response | unknown>;
 
@@ -39,55 +52,158 @@ function headersOf(init?: RequestInit): Record<string, string> {
   return (init?.headers ?? {}) as Record<string, string>;
 }
 
-const noSleep = vi.fn(async (_ms: number) => undefined);
-
-function makeClient(fetchImpl: typeof fetch, extra: Partial<ConstructorParameters<typeof ExampleClient>[0]> = {}) {
-  return new ExampleClient({ apiKey: 'k', baseUrl: BASE, fetchImpl, sleep: noSleep, ...extra });
+function methodsOf(fetchImpl: ReturnType<typeof makeFetch>): string[] {
+  return fetchImpl.mock.calls.map(call => String((call[1] as RequestInit | undefined)?.method));
 }
 
-describe('ExampleClient', () => {
-  it('sends the API key and User-Agent headers and never follows redirects', async () => {
+const noSleep = vi.fn(async (_ms: number) => undefined);
+
+function makeClient(fetchImpl: typeof fetch, extra: Partial<PipedriveClientOptions> = {}) {
+  return pc({ baseUrl: BASE, fetchImpl, sleep: noSleep, ...extra });
+}
+
+const OBJ = '/api/v2';
+
+describe('PipedriveClient', () => {
+  it('sends the API token in x-api-token with the User-Agent, never in the URL, and never follows redirects', async () => {
     let seenUrl = '';
     let seenInit: RequestInit | undefined;
     const fetchImpl = makeFetch((url, init) => {
       seenUrl = url;
       seenInit = init;
-      return { id: '1' };
+      return { id: '12', properties: {} };
     });
 
-    await new ExampleClient({ apiKey: 'secret-key', baseUrl: `${BASE}/`, fetchImpl }).get('/items/1', { q: 'x' });
+    await pc({ baseUrl: `${BASE}/`, fetchImpl }).get(`${OBJ}/deals/12`, { include_fields: 'x' });
 
-    expect(seenUrl).toBe(`${BASE}/items/1?q=x`);
-    expect(headersOf(seenInit)[API_KEY_HEADER]).toBe('secret-key');
+    expect(seenUrl).toBe(`${BASE}${OBJ}/deals/12?include_fields=x`);
+    expect(seenUrl).not.toContain(TOKEN);
+    expect(seenInit?.method).toBe('GET');
+    expect(API_KEY_HEADER).toBe('x-api-token');
+    expect(headersOf(seenInit)[API_KEY_HEADER]).toBe(TOKEN);
     expect(headersOf(seenInit)['User-Agent']).toBe(USER_AGENT);
     expect(seenInit?.redirect).toBe('manual');
+    expect(seenInit?.body).toBeUndefined();
   });
 
-  it('throws before sending anything when the API key or base URL is missing', async () => {
-    const fetchImpl = makeFetch(() => ({}));
-    delete process.env.EXAMPLE_API_KEY;
-    delete process.env.EXAMPLE_BASE_URL;
+  it('joins a list in the query with commas, as Pipedrive takes lists', () => {
+    const url = new URL(pc({}).buildUrl(`${OBJ}/deals`, { ids: [1, 2], status: 'open' }));
+    expect(url.searchParams.get('ids')).toBe('1,2');
+    expect(url.searchParams.get('status')).toBe('open');
+  });
 
-    await expect(new ExampleClient({ baseUrl: BASE, fetchImpl }).get('/x')).rejects.toThrow('EXAMPLE_API_KEY');
-    await expect(new ExampleClient({ apiKey: 'k', fetchImpl }).get('/x')).rejects.toThrow('EXAMPLE_BASE_URL');
+  it('throws before sending anything when the access token is missing, and uses the documented host by default', async () => {
+    const fetchImpl = makeFetch(() => ({}));
+    for (const name of Object.keys(process.env)) if (name.startsWith('PIPEDRIVE_')) delete process.env[name];
+
+    await expect(new PipedriveClient({ fetchImpl }).get('/x')).rejects.toThrow('PIPEDRIVE_API_TOKEN');
+    await expect(new PipedriveClient({ fetchImpl, apiToken: '' }).get('/x')).rejects.toThrow('PIPEDRIVE_API_TOKEN');
+    await expect(new PipedriveClient({ fetchImpl }).post(`${OBJ}/deals`, {})).rejects.toThrow('PIPEDRIVE_API_TOKEN');
     expect(fetchImpl).not.toHaveBeenCalled();
+    expect(new PipedriveClient({ fetchImpl }).baseUrl).toBe(BASE);
+
+    // The standalone server reads the token from the environment; an instance given credentialEnv {} never does.
+    process.env.PIPEDRIVE_API_TOKEN = TOKEN;
+    await new PipedriveClient({ fetchImpl }).get('/x');
+    expect(headersOf(fetchImpl.mock.calls[0]?.[1] as RequestInit)[API_KEY_HEADER]).toBe(TOKEN);
+    await expect(new PipedriveClient({ fetchImpl, credentialEnv: {} }).get('/x')).rejects.toThrow('PIPEDRIVE_API_TOKEN');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('pins the token to the Pipedrive API host', () => {
+    delete process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL;
+    expect(() => pc({ baseUrl: BASE })).not.toThrow();
+    expect(() => pc({ baseUrl: 'https://API.PIPEDRIVE.COM' })).not.toThrow();
+    expect(() => pc({ baseUrl: 'https://api.pipedrive.com.evil.test' })).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://evil.api.pipedrive.com' })).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://evil.test' })).toThrow(/must be on/);
+    expect(() => pc({ baseUrl: 'https://evil.test', allowCustomBaseUrl: true })).not.toThrow();
+  });
+
+  it('sends only the writes on its fixed list, refused before the token is sent, and has no DELETE', async () => {
+    const fetchImpl = makeFetch(() => jsonResponse({ success: true, data: { id: 1 } }, 200));
+    const client = makeClient(fetchImpl);
+    const refused: Array<[string, () => Promise<unknown>]> = [
+      ['post a record id', () => client.post(`${OBJ}/deals/1`, {})],
+      ['merge persons', () => client.put('/api/v1/persons/1/merge', {})],
+      ['merge organizations', () => client.put('/api/v1/organizations/1/merge', {})],
+      ['merge deals', () => client.put('/api/v1/deals/1/merge', {})],
+      ['duplicate a deal', () => client.post(`${OBJ}/deals/1/duplicate`, {})],
+      ['v1 deal', () => client.post('/api/v1/deals', {})],
+      ['v1 put a deal', () => client.put('/api/v1/deals/1', {})],
+      ['bulk', () => client.put('/api/v1/activities/bulk', {})],
+      ['pipeline', () => client.post(`${OBJ}/pipelines`, {})],
+      ['stage', () => client.patch(`${OBJ}/stages/1`, {})],
+      ['product', () => client.post(`${OBJ}/products`, {})],
+      ['deal field', () => client.post('/api/v1/dealFields', {})],
+      ['user', () => client.post('/api/v1/users', {})],
+      ['change a user', () => client.put('/api/v1/users/1', {})],
+      ['permission set', () => client.post('/api/v1/roles', {})],
+      ['webhook', () => client.post('/api/v1/webhooks', {})],
+      ['mail', () => client.post('/api/v1/mailbox/mailThreads', {})],
+      ['file', () => client.post('/api/v1/files', {})],
+      ['filter', () => client.post('/api/v1/filters', {})],
+      ['deal participant', () => client.post(`${OBJ}/deals/1/participants`, {})],
+      ['trailing slash', () => client.post(`${OBJ}/deals/`, {})],
+      ['patch a type', () => client.patch(`${OBJ}/deals`, {})],
+      ['patch a note', () => client.patch('/api/v1/notes/1', {})],
+      ['put a note list', () => client.put('/api/v1/notes', {})],
+      ['leading zero', () => client.patch(`${OBJ}/deals/012`, {})],
+      ['not an id', () => client.patch(`${OBJ}/deals/x`, {})],
+    ];
+    for (const [what, call] of refused) {
+      const error = (await call().catch((e: unknown) => e)) as Error;
+      expect(error.message, what).toMatch(/^Refused: (POST|PATCH|PUT) to that Pipedrive path/);
+      expect(error.message).not.toContain(TOKEN);
+    }
+    // Nothing was sent, so the token never left in a header.
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    for (const call of [
+      () => client.post(`${OBJ}/deals`, {}),
+      () => client.post(`${OBJ}/persons`, {}),
+      () => client.post(`${OBJ}/organizations`, {}),
+      () => client.post(`${OBJ}/activities`, {}),
+      () => client.patch(`${OBJ}/deals/7`, {}),
+      () => client.patch(`${OBJ}/activities/7`, {}),
+      () => client.post('/api/v1/notes', {}),
+      () => client.put('/api/v1/notes/7', {}),
+    ]) {
+      await expect(call()).resolves.toEqual({ success: true, data: { id: 1 } });
+    }
+    expect(methodsOf(fetchImpl)).toEqual(['POST', 'POST', 'POST', 'POST', 'PATCH', 'PATCH', 'POST', 'PUT']);
+    expect('delete' in client).toBe(false);
+    expect(ALLOWED_WRITES.every(entry => entry.method !== ('DELETE' as string))).toBe(true);
+  });
+
+  it('gives a read-only tool a client that sends only GET', async () => {
+    const fetchImpl = makeFetch(() => ({ success: true, data: [] }));
+    const client = readOnlyClient(makeClient(fetchImpl), 'pipedrive_get_deal');
+    await expect(client.post(`${OBJ}/deals`, {})).rejects.toThrow('Read-only tool pipedrive_get_deal attempted an upstream POST');
+    await expect(client.patch(`${OBJ}/deals/1`, {})).rejects.toThrow('Read-only tool pipedrive_get_deal attempted an upstream PATCH');
+    await expect(client.put('/api/v1/notes/1', {})).rejects.toThrow('Read-only tool pipedrive_get_deal attempted an upstream PUT');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(client.get(`${OBJ}/deals/1`)).resolves.toEqual({ success: true, data: [] });
+    expect(methodsOf(fetchImpl)).toEqual(['GET']);
+    expect(Object.keys(client).sort()).toEqual(['get', 'patch', 'post', 'put']);
   });
 
   it('refuses unsafe base URLs without echoing credentials', () => {
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://api.vendor.test' })).toThrow('https://');
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'not a url' })).toThrow('not a valid URL');
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://127.0.0.1:8080/api' })).not.toThrow();
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://localhost:8080/api' })).not.toThrow();
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://[::1]:8080/api' })).not.toThrow();
+    expect(() => pc({ baseUrl: 'http://api.vendor.test' })).toThrow('https://');
+    expect(() => pc({ baseUrl: 'http://api.pipedrive.com' })).toThrow('https://');
+    expect(() => pc({ baseUrl: 'not a url' })).toThrow('not a valid URL');
+    expect(() => pc({ baseUrl: 'http://127.0.0.1:8080/api' })).not.toThrow();
+    expect(() => pc({ baseUrl: 'http://localhost:8080/api' })).not.toThrow();
+    expect(() => pc({ baseUrl: 'http://[::1]:8080/api' })).not.toThrow();
 
     for (const baseUrl of [
       'https://user:hunter2@api.vendor.test/v1',
-      'https://api.vendor.test/v1?x=1',
-      'https://api.vendor.test/v1#frag',
+      'https://api.pipedrive.com?x=1',
+      'https://api.pipedrive.com#frag',
     ]) {
       let message = '';
       try {
-        new ExampleClient({ apiKey: 'k', baseUrl });
+        pc({ baseUrl });
       } catch (error) {
         message = (error as Error).message;
       }
@@ -97,38 +213,53 @@ describe('ExampleClient', () => {
   });
 
   it('validates numeric environment variables and options instead of producing NaN', () => {
-    process.env.EXAMPLE_TIMEOUT_MS = '30s';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_TIMEOUT_MS');
-    process.env.EXAMPLE_TIMEOUT_MS = '3000000000';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_TIMEOUT_MS');
-    delete process.env.EXAMPLE_TIMEOUT_MS;
-    process.env.EXAMPLE_MAX_CONCURRENCY = 'many';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_MAX_CONCURRENCY');
-    delete process.env.EXAMPLE_MAX_CONCURRENCY;
-    process.env.EXAMPLE_MAX_RESPONSE_BYTES = '10MB';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_MAX_RESPONSE_BYTES');
-    delete process.env.EXAMPLE_MAX_RESPONSE_BYTES;
-    process.env.EXAMPLE_ALLOW_CUSTOM_BASE_URL = 'perhaps';
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: BASE })).toThrow('EXAMPLE_ALLOW_CUSTOM_BASE_URL');
+    process.env.PIPEDRIVE_TIMEOUT_MS = '30s';
+    expect(() => pc({})).toThrow('PIPEDRIVE_TIMEOUT_MS');
+    process.env.PIPEDRIVE_TIMEOUT_MS = '3000000000';
+    expect(() => pc({})).toThrow('PIPEDRIVE_TIMEOUT_MS');
+    delete process.env.PIPEDRIVE_TIMEOUT_MS;
+    process.env.PIPEDRIVE_MAX_CONCURRENCY = 'many';
+    expect(() => pc({})).toThrow('PIPEDRIVE_MAX_CONCURRENCY');
+    delete process.env.PIPEDRIVE_MAX_CONCURRENCY;
+    process.env.PIPEDRIVE_MAX_RESPONSE_BYTES = '10MB';
+    expect(() => pc({})).toThrow('PIPEDRIVE_MAX_RESPONSE_BYTES');
+    delete process.env.PIPEDRIVE_MAX_RESPONSE_BYTES;
+    process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL = 'perhaps';
+    expect(() => pc({ baseUrl: BASE })).toThrow('PIPEDRIVE_ALLOW_CUSTOM_BASE_URL');
+    delete process.env.PIPEDRIVE_ALLOW_CUSTOM_BASE_URL;
 
-    expect(() => new ExampleClient({ apiKey: 'k', maxConcurrency: 0 })).toThrow('maxConcurrency');
-    expect(() => new ExampleClient({ apiKey: 'k', maxConcurrency: Number.NaN })).toThrow('maxConcurrency');
-    expect(() => new ExampleClient({ apiKey: 'k', timeoutMs: 2 ** 31 })).toThrow('timeoutMs');
-    expect(() => new ExampleClient({ apiKey: 'k', maxAttempts: 0 })).toThrow('maxAttempts');
+    expect(() => pc({ maxConcurrency: 0 })).toThrow('maxConcurrency');
+    expect(() => pc({ maxConcurrency: Number.NaN })).toThrow('maxConcurrency');
+    expect(() => pc({ timeoutMs: 2 ** 31 })).toThrow('timeoutMs');
+    expect(() => pc({ maxAttempts: 0 })).toThrow('maxAttempts');
   });
 });
 
 describe('error handling', () => {
-  it('gives the status and our own hint, never the vendor body or code', async () => {
-    const fetchImpl = makeFetch(() => jsonResponse({ code: 'invalid_key', message: 'Unrecognized key' }, 401));
-    const error = await makeClient(fetchImpl).get('/x').catch((e: unknown) => e);
+  it('gives the status and our own hint on 401 and 403, never the vendor body or code, and does not retry', async () => {
+    const vendor = {
+      status: 'error',
+      category: 'INVALID_AUTHENTICATION',
+      message: 'Authentication credentials not found for this portal',
+      correlationId: 'corr-id-zzzzzzzzzzzz',
+    };
+    for (const [status, hint] of [
+      [401, 'Pipedrive did not accept the API token.'],
+      [403, 'the user whose token this is may not see or change this'],
+    ] as const) {
+      const fetchImpl = makeFetch(() => jsonResponse(vendor, status));
+      const error = await makeClient(fetchImpl).get('/x').catch((e: unknown) => e);
 
-    expect(error).toBeInstanceOf(ExampleHttpError);
-    expect((error as ExampleHttpError).status).toBe(401);
-    expect((error as Error).message).toContain('HTTP 401');
-    expect((error as Error).message).toContain('EXAMPLE_API_KEY');
-    expect((error as Error).message).not.toContain('Unrecognized key');
-    expect((error as Error).message).not.toContain('invalid_key');
+      expect(error).toBeInstanceOf(PipedriveHttpError);
+      expect((error as PipedriveHttpError).status).toBe(status);
+      expect((error as Error).message).toContain(`HTTP ${status}`);
+      expect((error as Error).message).toContain(hint);
+      expect(JSON.stringify({ ...(error as object), message: (error as Error).message })).not.toMatch(
+        /INVALID_AUTHENTICATION|Authentication credentials|corr-id|correlationId/,
+      );
+      // The token is used as given and never renewed: an authorisation failure is sent once.
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('never puts an error body in the error', async () => {
@@ -136,8 +267,8 @@ describe('error handling', () => {
     const fetchImpl = makeFetch(() => new Response(html, { status: 502, headers: { 'content-type': 'text/html' } }));
     const error = (await makeClient(fetchImpl, { maxAttempts: 1 })
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error.message).toBe('Example API request failed with HTTP 502');
+      .catch((e: unknown) => e)) as PipedriveHttpError;
+    expect(error.message).toBe('Pipedrive API request failed with HTTP 502');
   });
 
   it('reads at most 64 KB of an error body', async () => {
@@ -156,40 +287,44 @@ describe('error handling', () => {
     );
     const error = (await makeClient(fetchImpl)
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error).toBeInstanceOf(ExampleHttpError);
+      .catch((e: unknown) => e)) as PipedriveHttpError;
+    expect(error).toBeInstanceOf(PipedriveHttpError);
     expect(pulled).toBeLessThan(10);
     expect(error.message.length).toBeLessThan(700);
   });
 
-  it('redacts the configured API key wherever it appears, before truncating', async () => {
-    const apiKey = 'live-key-0123456789abcdef';
+  it('redacts the configured access token wherever it appears, before truncating', async () => {
+    const apiToken = 'fake-token-0000000000000000'; // gitleaks:allow (a test value, not a key)
     const respond = (body: string, type = 'text/plain') =>
-      new ExampleClient({
-        apiKey,
+      pc({
+        apiToken,
         baseUrl: BASE,
         fetchImpl: makeFetch(() => new Response(body, { status: 400, headers: { 'content-type': type } })),
       });
 
-    const echoed = (await respond(`proxy error: ${apiKey} and ${encodeURIComponent(apiKey)}`)
+    const echoed = (await respond(`proxy error: ${apiToken} and ${encodeURIComponent(apiToken)}`)
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(echoed.message).not.toContain(apiKey);
+      .catch((e: unknown) => e)) as PipedriveHttpError;
+    expect(echoed.message).not.toContain(apiToken);
     expect(echoed.message).not.toContain('proxy error');
 
-    const boundary = (await respond(`${'x'.repeat(490)}${apiKey}`)
+    const boundary = (await respond(`${'x'.repeat(490)}${apiToken}`)
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(boundary.message).not.toContain(apiKey.slice(0, 6));
+      .catch((e: unknown) => e)) as PipedriveHttpError;
+    expect(boundary.message).not.toContain(apiToken.slice(0, 6));
 
-    const nested = (await respond(JSON.stringify({ message: 'bad', nested: { echo: apiKey } }), 'application/json')
+    const nested = (await respond(JSON.stringify({ message: 'bad', nested: { echo: apiToken } }), 'application/json')
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(JSON.stringify(nested)).not.toContain(apiKey);
+      .catch((e: unknown) => e)) as PipedriveHttpError;
+    expect(JSON.stringify(nested)).not.toContain(apiToken);
+
+    const redactor = pc({ apiToken }).redactor;
+    expect(redactor.redact(`echo ${apiToken} again`)).not.toContain(apiToken);
+    expect(redactor.redact(`Authorization: Bearer ${apiToken}`)).not.toContain(apiToken);
 
     expect(redactSecrets('X-API-KEY: abc123')).not.toContain('abc123');
     expect(redactSecrets('Authorization: Bearer abc123')).not.toContain('abc123');
-    expect(redactSecrets('EXAMPLE_API_KEY=abc123')).not.toContain('abc123');
+    expect(redactSecrets('PIPEDRIVE_API_TOKEN=abc123')).not.toContain('abc123');
   });
 
   it('redacts the configured key header by name', () => {
@@ -218,9 +353,9 @@ describe('error handling', () => {
   it('keeps query strings out of error URLs', async () => {
     const fetchImpl = makeFetch(() => jsonResponse({}, 400));
     const error = (await makeClient(fetchImpl)
-      .get('/items', { cursor: 'secret-cursor' })
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error.url).toBe(`${BASE}/items`);
+      .get(`${OBJ}/contacts`, { after: 'secret-cursor' })
+      .catch((e: unknown) => e)) as PipedriveHttpError;
+    expect(error.url).toBe(`${BASE}${OBJ}/contacts`);
     expect(error.message).not.toContain('secret-cursor');
   });
 
@@ -243,7 +378,7 @@ describe('error handling', () => {
     const message = await makeClient(fetchImpl, { maxAttempts: 1 })
       .get('/x')
       .catch((e: Error) => e.message);
-    expect(message).toMatch(/Network error calling the Example API \(GET\) \(ENOTFOUND\)\./);
+    expect(message).toMatch(/Network error calling the Pipedrive API \(GET\) \(ENOTFOUND\)\./);
     expect(message).not.toMatch(/odd|getaddrinfo/);
   });
 
@@ -279,13 +414,13 @@ describe('redirects', () => {
       () => new Response(null, { status: 302, headers: { location: 'https://other.vendor.test/v1/items?t=1' } }),
     );
     const message = await makeClient(fetchImpl)
-      .get('/items')
+      .get(`${OBJ}/contacts/1`)
       .catch((e: Error) => e.message);
     expect(message).toContain('redirect (HTTP 302) for GET');
-    expect(message).toContain('EXAMPLE_BASE_URL');
+    expect(message).toContain('PIPEDRIVE_BASE_URL');
     // The Location is the vendor's text: never quoted.
     expect(message).not.toContain('other.vendor.test');
-    await expect(makeClient(fetchImpl).post('/items', {})).rejects.toThrow(/redirect/);
+    await expect(makeClient(fetchImpl).post(`${OBJ}/persons`, {})).rejects.toThrow(/redirect/);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes('other.vendor.test'))).toBe(true);
   });
@@ -318,9 +453,9 @@ describe('retries and concurrency', () => {
     const sleep = vi.fn(async (_ms: number) => undefined);
     const error = (await makeClient(fetchImpl, { sleep })
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
+      .catch((e: unknown) => e)) as PipedriveHttpError;
 
-    expect(error).toBeInstanceOf(ExampleHttpError);
+    expect(error).toBeInstanceOf(PipedriveHttpError);
     expect(error.message).toContain('retry-after=3600s');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
@@ -345,18 +480,21 @@ describe('retries and concurrency', () => {
     expect(permanent).toHaveBeenCalledTimes(1);
   });
 
-  it('never retries POST or PATCH', async () => {
-    const fetchImpl = makeFetch(() => jsonResponse({}, 503));
-    const client = makeClient(fetchImpl);
-    await expect(client.post('/x', {})).rejects.toBeInstanceOf(ExampleHttpError);
-    await expect(client.patch('/x', {})).rejects.toBeInstanceOf(ExampleHttpError);
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  it('never retries writes (POST, PATCH), on a retryable status or a network error', async () => {
+    for (const status of [429, 503]) {
+      const fetchImpl = makeFetch(() => jsonResponse({}, status));
+      const client = makeClient(fetchImpl);
+      await expect(client.post(`${OBJ}/persons`, {})).rejects.toBeInstanceOf(PipedriveHttpError);
+      await expect(client.patch(`${OBJ}/persons/7`, {})).rejects.toBeInstanceOf(PipedriveHttpError);
+      expect(methodsOf(fetchImpl)).toEqual(['POST', 'PATCH']);
+    }
 
     const failing = makeFetch(() => {
       throw new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) });
     });
-    await expect(makeClient(failing).post('/x', {})).rejects.toThrow('Network error');
-    expect(failing).toHaveBeenCalledTimes(1);
+    await expect(makeClient(failing).post(`${OBJ}/persons`, {})).rejects.toThrow('Network error');
+    await expect(makeClient(failing).patch(`${OBJ}/deals/7`, {})).rejects.toThrow('Network error');
+    expect(failing).toHaveBeenCalledTimes(2);
   });
 
   it('releases the concurrency slot after failures', async () => {
@@ -373,7 +511,7 @@ describe('retries and concurrency', () => {
     });
     const client = makeClient(fetchImpl, { maxConcurrency: 1 });
     await expect(client.get('/x')).rejects.toThrow('timed out');
-    await expect(client.get('/x')).rejects.toBeInstanceOf(ExampleHttpError);
+    await expect(client.get('/x')).rejects.toBeInstanceOf(PipedriveHttpError);
     await expect(client.get('/x')).resolves.toEqual({ ok: true });
   });
 
@@ -413,19 +551,19 @@ describe('against a local upstream (real sockets)', () => {
     const seen: Array<{ url?: string; key?: string }> = [];
     const base = await startUpstream((req, res) => {
       seen.push({ url: req.url, key: req.headers[API_KEY_HEADER.toLowerCase()] as string | undefined });
-      if (req.url === '/v1/items/1') {
+      if (req.url === '/v1/contacts/1') {
         res.writeHead(200, { 'content-type': 'application/json' }).end('{"id":"1"}');
         return;
       }
-      res.writeHead(302, { location: `${base}/items/1` }).end();
+      res.writeHead(302, { location: `${base}/contacts/1` }).end();
     });
-    const client = new ExampleClient({ apiKey: 'local-key-123456', baseUrl: base });
+    const client = pc({ apiToken: 'fake-local-key-1111', baseUrl: base });
 
-    await expect(client.get('/items/1')).resolves.toEqual({ id: '1' });
+    await expect(client.get('/contacts/1')).resolves.toEqual({ id: '1' });
     await expect(client.get('/moved')).rejects.toThrow('redirects are not followed');
     expect(seen).toEqual([
-      { url: '/v1/items/1', key: 'local-key-123456' },
-      { url: '/v1/moved', key: 'local-key-123456' },
+      { url: '/v1/contacts/1', key: 'fake-local-key-1111' },
+      { url: '/v1/moved', key: 'fake-local-key-1111' },
     ]);
   });
 
@@ -433,7 +571,7 @@ describe('against a local upstream (real sockets)', () => {
     const base = await startUpstream(() => {
       // never answers
     });
-    const client = new ExampleClient({ apiKey: 'k', baseUrl: base, timeoutMs: 100, maxAttempts: 1 });
+    const client = pc({ baseUrl: base, timeoutMs: 100, maxAttempts: 1 });
     await expect(client.get('/slow')).rejects.toThrow(/timed out after 100 ms/);
     upstream?.closeAllConnections();
   });
