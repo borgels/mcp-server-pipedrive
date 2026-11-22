@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+- Gateway error results carry failure metadata: when the upstream API
+  answered with an HTTP error or a redirect (never followed), or the token
+  endpoint refused a renewal (400 or 401), the result has
+  `failure: { httpStatus, requestId? }`, so a host can count failures by
+  status without reading their text. `requestId` is the vendor's own id from
+  a response header (`REQUEST_ID_HEADERS`), kept only when it is a hex id of
+  8 to 64 characters (one run of hex digits, or groups of four or more joined
+  by single hyphens, as in a UUID) and does not hold the shape of a personal
+  number. It is checked again after redaction, so an id that shared a piece
+  with the key is dropped. Never the body, the vendor's error code or
+  message. The same form as mcp-server-hubspot 0.3.0.
+
 ## 0.3.1
 
 - Licensor and copyright holder corrected to Borgels Services ApS in `LICENSE`,
